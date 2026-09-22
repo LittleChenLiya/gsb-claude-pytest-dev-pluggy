@@ -15,6 +15,8 @@ import warnings
 
 from . import _tracing
 from ._callers import _multicall
+from ._explain import build_hook_call_plan
+from ._explain import normalize_kwargs_names
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     import importlib.metadata
 
     from ._compat import DistFacade
+    from ._explain import HookCallPlan
 
 
 _BeforeTrace: TypeAlias = Callable[[str, Sequence[HookImpl], Mapping[str, Any]], None]
@@ -617,6 +620,54 @@ class PluginManager:
         if not plugins_to_remove:
             return orig
         return _SubsetHookCaller(orig, plugins_to_remove)
+
+    def explain_hook(
+        self,
+        name: str,
+        kwargs: Iterable[str] | Mapping[str, object] | None = None,
+        remove_plugins: Iterable[_Plugin | str] | None = None,
+    ) -> HookCallPlan:
+        """Return a static execution plan for one call of the named hook.
+
+        The call is never performed: hook implementations, wrappers,
+        descriptors and result callbacks are only inspected, never executed.
+        The plan is an immutable, independent snapshot, so registering or
+        unregistering plugins afterwards does not alter it.
+
+        Ordering and plugin filtering use the real HookCaller machinery
+        (including tryfirst, trylast, wrapper, old-style hookwrapper and
+        subset_hook_caller semantics). The returned HookCallPlan records
+        HookExplainStep objects for the three execution phases (wrapper
+        entry, normal implementations, wrapper teardown). For firstresult
+        hooks, implementations after a possible short-circuit point are
+        marked conditional; the plan never predicts which implementation
+        wins.
+
+        :param name:
+            Name of the hook to explain.
+        :param kwargs:
+            Either the names of the arguments the planned call would provide
+            (an iterable of strings), or the actual keyword-argument mapping
+            (only its keys are used).
+        :param remove_plugins:
+            Optional iterable of plugin objects or registered plugin names to
+            exclude, exactly as for subset_hook_caller. Entries that do not
+            identify a registered plugin produce an ExplainDiagnostic with
+            code "invalid_remove_plugin".
+
+        :returns:
+            An immutable HookCallPlan. Unknown hook names yield a plan with
+            empty phases and a diagnostic with code "unknown_hook"; arguments
+            required by the spec or by an implementation but missing from
+            kwargs yield diagnostics with code "missing_arguments" (the
+            steps still show where a real call would fail).
+        """
+        return build_hook_call_plan(
+            self,
+            name,
+            normalize_kwargs_names(kwargs),
+            tuple(remove_plugins) if remove_plugins is not None else (),
+        )
 
 
 def _formatdef(func: Callable[..., object]) -> str:

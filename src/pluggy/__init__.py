@@ -1,6 +1,9 @@
 __all__ = [
+    "ExplainDiagnostic",
     "HookCallError",
+    "HookCallPlan",
     "HookCaller",
+    "HookExplainStep",
     "HookImpl",
     "HookRelay",
     "HookimplMarker",
@@ -14,6 +17,9 @@ __all__ = [
     "Result",
     "__version__",
 ]
+from ._explain import ExplainDiagnostic
+from ._explain import HookCallPlan
+from ._explain import HookExplainStep
 from ._hooks import HookCaller
 from ._hooks import HookImpl
 from ._hooks import HookimplMarker

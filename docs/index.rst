@@ -1015,6 +1015,39 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+
+Explaining a hook call
+----------------------
+For debugging and tooling you can plan a hook call without performing it
+using :py:meth:`pluggy.PluginManager.explain_hook`. It returns an immutable
+:py:class:`pluggy.HookCallPlan` snapshot describing the three phases of the
+call -- wrapper entry, normal implementations and wrapper teardown -- with a
+:py:class:`pluggy.HookExplainStep` for each implementation carrying the
+plugin registration name, function location, bound arguments and possible
+short-circuit points:
+
+.. code-block:: python
+
+    plan = pm.explain_hook("my_hook", kwargs=["arg1", "arg2"])
+    for step in plan.impl_steps:
+        print(step.plugin_name, step.location, step.argnames)
+
+No plugin code is executed: implementations, wrappers, descriptors and
+result callbacks are only inspected. The ordering and filtering reuse the
+real HookCaller rules (tryfirst, trylast, wrapper, old-style hookwrapper,
+firstresult and subset_hook_caller filtering), so the plan cannot drift
+from an actual call. For firstresult hooks the steps following a possible
+short-circuit point are marked conditional
+(HookExplainStep.conditional); which implementation actually wins is never
+predicted.
+
+Plugins can be excluded with the remove_plugins argument (plugin objects or
+registered names), exactly as with subset_hook_caller. Problems are
+reported as :py:class:`pluggy.ExplainDiagnostic` objects in the plan's
+diagnostics with the codes "unknown_hook", "missing_arguments" and
+"invalid_remove_plugin". The returned plan is an independent snapshot:
+later registrations or unregistrations never modify it.
+
 Public API
 **********
 Please see the :doc:`api_reference`.

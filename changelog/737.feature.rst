@@ -1,0 +1,5 @@
+Added :py:meth:`pluggy.PluginManager.explain_hook`, which returns an
+immutable :py:class:`pluggy.HookCallPlan` describing how a hook call would
+enter wrappers, run implementations and exit wrappers without executing any
+plugin code, including firstresult conditional steps and diagnostics for
+unknown hooks, missing arguments and invalid plugin filters.

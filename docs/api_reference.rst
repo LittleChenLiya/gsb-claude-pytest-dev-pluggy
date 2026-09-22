@@ -29,6 +29,15 @@ API Reference
     :members:
     :special-members: __call__
 
+.. autoclass:: pluggy.HookCallPlan()
+    :members:
+
+.. autoclass:: pluggy.HookExplainStep()
+    :members:
+
+.. autoclass:: pluggy.ExplainDiagnostic()
+    :members:
+
 .. autoclass:: pluggy.HookCallError()
     :show-inheritance:
     :members:
