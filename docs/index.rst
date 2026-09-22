@@ -1015,6 +1015,51 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+Explaining hook calls
+---------------------
+Sometimes it is useful to inspect how a hook call would flow through the
+registered plugins without actually running any plugin code -- for example
+when debugging ordering problems or when plugin implementations have
+dangerous side effects.
+
+:py:meth:`pluggy.PluginManager.explain_hook()` takes a hook name, the
+names of the arguments the call would provide, and an optional set of
+plugins to exclude, and returns an immutable
+:py:class:`~pluggy.HookPlan` describing the call in three phases:
+
+* **enter**: the pre-``yield`` parts of new-style
+  :ref:`wrappers <hookwrapper>` and :ref:`old-style hookwrappers
+  <old_style_hookwrappers>`, in the order the real call runs them;
+* **impls**: the regular implementations, in the order the real call runs
+  them, honoring :ref:`tryfirst/trylast <callorder>`;
+* **exit**: the post-``yield`` parts of the wrappers,
+  innermost first.
+
+Each :py:class:`~pluggy.HookPlanStep` carries the plugin registration
+name, the function location, the argument names it receives, and flags for
+:ref:`firstresult` conditional execution and short-circuiting.
+Ordering and filtering reuse the real :py:class:`~pluggy.HookCaller`
+machinery, including :ref:`optionalhook` implementations, so the plan
+matches an actual call. No hook implementation, wrapper, descriptor or result
+callback is executed, and the returned plan is an independent snapshot --
+later registrations or unregistrations do not change it.
+
+Unknown hooks, missing required arguments and invalid plugin filters do not
+raise; they are reported as :py:class:`~pluggy.HookPlanDiagnostic`
+entries in the plan instead.
+
+.. code-block:: python
+
+    plan = pm.explain_hook("my_hook", {"arg1", "arg2"})
+    for step in plan.steps:
+        print(step.phase, step.plugin_name, step.function_name, step.location)
+    for diag in plan.diagnostics:
+        print(diag.kind, diag.message)
+
+A full runnable example, including a side-by-side comparison with a real
+call, is available at
+`examples/explain_hook.py`.
+
 Public API
 **********
 Please see the :doc:`api_reference`.

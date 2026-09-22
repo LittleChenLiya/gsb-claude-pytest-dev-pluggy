@@ -1,0 +1,6 @@
+Added :meth:`pluggy.PluginManager.explain_hook`, which returns an immutable
+:class:`pluggy.HookPlan` describing how a hook call would flow (wrapper enter,
+regular implementations, wrapper exit) without executing any plugin code. The plan
+reuses the real :class:`pluggy.HookCaller` ordering and subset filtering and
+reports unknown hooks, missing arguments and invalid plugin filters as structured
+diagnostics.

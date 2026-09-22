@@ -15,6 +15,8 @@ import warnings
 
 from . import _tracing
 from ._callers import _multicall
+from ._explain import explain_hook as _explain_hook
+from ._explain import HookPlan
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
@@ -617,6 +619,54 @@ class PluginManager:
         if not plugins_to_remove:
             return orig
         return _SubsetHookCaller(orig, plugins_to_remove)
+
+    def explain_hook(
+        self,
+        hook_name: str,
+        argnames: Iterable[str] = (),
+        remove_plugins: Iterable[_Plugin | str] = (),
+    ) -> HookPlan:
+        """Explain how a call to the given hook would execute, without
+        executing anything.
+
+        :param hook_name:
+            The name of the hook to explain.
+        :param argnames:
+            The names of the arguments the hypothetical call would provide
+            (as keyword arguments). Used to diagnose missing arguments and
+            to show which arguments each implementation receives.
+        :param remove_plugins:
+            Optional plugins (or registered plugin names) to exclude from
+            the call, filtered with the same rules as
+            :meth:`subset_hook_caller`.
+
+        :returns:
+            A :class:`~pluggy.HookPlan` with the call broken into *enter*
+            (wrapper setup), *impl* (regular implementations) and *exit*
+            (wrapper teardown) phases, plus diagnostics. Each step carries
+            the plugin registration name, the function location, the
+            argument names it receives, and whether it is conditional or
+            may short-circuit (for :ref:`firstresult` hooks).
+
+        The ordering and filtering reuse the real :class:`~pluggy.HookCaller`
+        machinery, so the plan matches an actual call, including
+        :ref:`tryfirst/trylast <callorder>` ordering, new-style
+        :ref:`wrappers <hookwrapper>`, :ref:`old-style hookwrappers
+        <old_style_hookwrappers>`, :ref:`firstresult` and
+        :ref:`optionalhook` implementations.
+
+        No hook implementation, wrapper, descriptor or result callback is
+        executed. The returned plan is an independent snapshot: later
+        registrations or unregistrations do not affect it.
+
+        Unknown hooks, missing required arguments and invalid plugin
+        filters are reported as :class:`~pluggy.HookPlanDiagnostic`\\ s in
+        :attr:`HookPlan.diagnostics <pluggy.HookPlan.diagnostics>` instead
+        of raising.
+
+        .. versionadded:: 1.7
+        """
+        return _explain_hook(self, hook_name, argnames, remove_plugins)
 
 
 def _formatdef(func: Callable[..., object]) -> str:
