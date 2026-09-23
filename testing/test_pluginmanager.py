@@ -1145,3 +1145,176 @@ def test_get_hookcallers_no_duplicates(pm: PluginManager) -> None:
     # Both hello impls are still wired up, and each caller works.
     assert pm.hook.hello(arg=1) == [101, 2]
     assert pm.hook.goodbye(arg=1) == [201]
+
+
+class TestRegisterMany:
+    def test_historic_replay_order_and_single_replay(self, pm: PluginManager) -> None:
+        class Hooks:
+            @hookspec(historic=True)
+            def he_method1(self, arg): ...
+
+        pm.add_hookspecs(Hooks)
+
+        out = []
+
+        class Old:
+            @hookimpl
+            def he_method1(self, arg):
+                out.append(("old", arg))
+
+        pm.register(Old(), "old")
+        pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+        assert out == [("old", 1)]
+
+        class P1:
+            @hookimpl
+            def he_method1(self, arg):
+                out.append(("p1", arg))
+
+        class P2:
+            @hookimpl(tryfirst=True)
+            def he_method1(self, arg):
+                out.append(("p2", arg))
+
+        names = pm.register_many([(P1(), "p1"), (P2(), "p2")])
+        assert names == ["p1", "p2"]
+        # Each new implementation sees the historic call exactly once,
+        # in batch input order.
+        assert out == [("old", 1), ("p1", 1), ("p2", 1)]
+        # New calls honor tryfirst ordering.
+        pm.hook.he_method1.call_historic(kwargs={"arg": 2})
+        assert out[-3:] == [("p2", 2), ("p1", 2), ("old", 2)]
+
+    def test_order_matches_sequential_register(self, pm: PluginManager) -> None:
+        class Hooks:
+            @hookspec
+            def he_method1(self, arg): ...
+
+        pm.add_hookspecs(Hooks)
+        pm2 = PluginManager("example")
+        pm2.add_hookspecs(Hooks)
+
+        class P1:
+            @hookimpl
+            def he_method1(self, arg): ...
+
+        class P2:
+            @hookimpl(tryfirst=True)
+            def he_method1(self, arg): ...
+
+        class P3:
+            @hookimpl(trylast=True)
+            def he_method1(self, arg): ...
+
+        class P4:
+            @hookimpl(wrapper=True)
+            def he_method1(self, arg):
+                return (yield)
+
+        batch = [(P1(), "p1"), (P2(), "p2"), (P3(), "p3"), (P4(), "p4")]
+        pm.register_many(batch)
+        for plugin, name in batch:
+            pm2.register(plugin, name)
+        order1 = [impl.plugin_name for impl in pm.hook.he_method1.get_hookimpls()]
+        order2 = [impl.plugin_name for impl in pm2.hook.he_method1.get_hookimpls()]
+        assert order1 == order2
+
+    def test_invalid_signature_rejects_entire_batch(self, pm: PluginManager) -> None:
+        class Hooks:
+            @hookspec
+            def he_method1(self, arg): ...
+
+        pm.add_hookspecs(Hooks)
+
+        class Good:
+            @hookimpl
+            def he_method1(self, arg): ...
+
+        class Bad:
+            @hookimpl
+            def he_method1(self, unknownarg): ...
+
+        good, bad = Good(), Bad()
+        with pytest.raises(PluginValidationError) as excinfo:
+            pm.register_many([(good, "good"), (bad, "bad")])
+        assert excinfo.value.plugin is bad
+        # Neither new plugin may appear in the manager.
+        assert pm.get_plugins() == set()
+        assert pm.list_name_plugin() == []
+        assert pm.hook.he_method1.get_hookimpls() == []
+
+    def test_multi_hook_plugin_with_later_invalid_hook(self, pm: PluginManager) -> None:
+        class Hooks:
+            @hookspec
+            def a_hook(self, arg): ...
+
+            @hookspec
+            def z_hook(self, arg): ...
+
+        pm.add_hookspecs(Hooks)
+
+        class Plugin:
+            @hookimpl
+            def a_hook(self, arg): ...
+
+            @hookimpl
+            def z_hook(self, wrongarg): ...
+
+        plugin = Plugin()
+        with pytest.raises(PluginValidationError) as excinfo:
+            pm.register_many([(plugin, "p")])
+        assert excinfo.value.plugin is plugin
+        # The valid a_hook implementation must not remain behind either.
+        assert pm.get_plugins() == set()
+        assert pm.hook.a_hook.get_hookimpls() == []
+        assert pm.hook.z_hook.get_hookimpls() == []
+
+    def test_batch_conflicts_are_rejected(self, pm: PluginManager) -> None:
+        class A:
+            pass
+
+        a1, a2 = A(), A()
+        with pytest.raises(ValueError, match="twice in the batch"):
+            pm.register_many([(a1, "x"), (a2, "x")])
+        with pytest.raises(ValueError, match="twice in the batch"):
+            pm.register_many([(a1, "x"), (a1, "y")])
+        pm.register(a1, "taken")
+        with pytest.raises(ValueError, match="already registered"):
+            pm.register_many([(a2, "taken")])
+        with pytest.raises(ValueError, match="different name"):
+            pm.register_many([(a1, "other")])
+        pm.set_blocked("blocked")
+        with pytest.raises(ValueError, match="blocked"):
+            pm.register_many([(a2, "blocked")])
+        # Only the pre-existing registration remains.
+        assert pm.get_plugins() == {a1}
+
+    def test_historic_replay_exception_keeps_batch(self, pm: PluginManager) -> None:
+        class Hooks:
+            @hookspec(historic=True)
+            def he_method1(self, arg): ...
+
+        pm.add_hookspecs(Hooks)
+        pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+
+        class MyError(Exception):
+            pass
+
+        class P1:
+            @hookimpl
+            def he_method1(self, arg): ...
+
+        class P2:
+            @hookimpl
+            def he_method1(self, arg):
+                raise MyError
+
+        with pytest.raises(MyError):
+            pm.register_many([(P1(), "p1"), (P2(), "p2")])
+        # The replay failure happened after publishing: the batch stays.
+        assert pm.has_plugin("p1")
+        assert pm.has_plugin("p2")
+        p1 = pm.unregister(name="p1")
+        p2 = pm.unregister(name="p2")
+        assert p1 is not None and p2 is not None
+        assert pm.get_plugins() == set()

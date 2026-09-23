@@ -263,6 +263,118 @@ class PluginManager:
             _get_marker_opts(found[0], self.project_name + "_impl"),
         )
 
+    def register_many(self, plugins: Iterable[tuple[_Plugin, str | None]]) -> list[str]:
+        """Register several plugins atomically and return their names.
+
+        :param plugins:
+            An ordered iterable of ``(plugin, name)`` pairs. ``name`` may be
+            ``None``, in which case a name is generated using
+            :func:`get_canonical_name`.
+
+        :returns:
+            The list of plugin names, in input order.
+
+        Registration happens in two phases. First all plugins are validated:
+        names must not be duplicated within the batch, must not clash with
+        already-registered or blocked names, and every hook implementation is
+        checked against its hook specification using the same marker parsing
+        and checks as :meth:`register` (without calling any hook
+        implementation or replaying historic calls). If any plugin fails
+        validation, a :exc:`ValueError` or :exc:`PluginValidationError`
+        identifying the offending plugin is raised and the manager is left
+        completely unchanged -- no plugin from the batch is registered.
+
+        Only if the entire batch validates, all plugins are published at
+        once. The resulting hookimpl ordering (including ``tryfirst``,
+        ``trylast`` and wrappers) is identical to calling :meth:`register`
+        for each plugin in input order. Afterwards, historic calls are
+        replayed to the new hook implementations, in the same order.
+
+        Historic call replays run user code after the batch has been
+        published. If a replay raises, the exception is propagated as-is and
+        the whole batch stays registered; pluggy does not attempt to roll
+        back side effects of user code.
+
+        The transaction boundary covers the synchronous registration only;
+        no additional thread-safety guarantees are made for concurrent
+        registrations.
+
+        .. versionadded:: 1.7
+        """
+        prepared: list[tuple[str, _Plugin, list[tuple[str, HookImpl]]]] = []
+        batch_names: list[str] = []
+        batch_plugins: list[_Plugin] = []
+        # Phase 1: validate the whole batch without mutating any state.
+        for plugin, name in plugins:
+            plugin_name = name or self.get_canonical_name(plugin)
+
+            if plugin_name in batch_names:
+                raise ValueError(
+                    f"Plugin name appears twice in the batch: {plugin_name}={plugin!r}"
+                )
+            if plugin_name in self._name2plugin:
+                if self._name2plugin[plugin_name] is None:
+                    raise ValueError(
+                        f"Plugin name is blocked: {plugin_name}={plugin!r}"
+                    )
+                raise ValueError(
+                    "Plugin name already registered: "
+                    f"{plugin_name}={plugin!r}\n{self._name2plugin}"
+                )
+            if any(plugin == other for other in batch_plugins):
+                raise ValueError(
+                    f"Plugin appears twice in the batch: {plugin_name}={plugin!r}"
+                )
+            if plugin in self._name2plugin.values():
+                raise ValueError(
+                    "Plugin already registered under a different name: "
+                    f"{plugin_name}={plugin!r}\n{self._name2plugin}"
+                )
+
+            hookimpls: list[tuple[str, HookImpl]] = []
+            for attr_name in dir(plugin):
+                hookimpl_opts = self.parse_hookimpl_opts(plugin, attr_name)
+                if hookimpl_opts is None:
+                    continue
+                normalize_hookimpl_opts(hookimpl_opts)
+                found = _static_hook_attr(plugin, attr_name)
+                # Only reachable when a subclass overrode parse_hookimpl_opts
+                # to claim an attribute pluggy cannot bind.
+                assert found is not None, (
+                    f"{plugin!r}.{attr_name} is not a hookable attribute"
+                )
+                method: _HookImplFunction[object] = found[1]
+                hookimpl = HookImpl(plugin, plugin_name, method, hookimpl_opts)
+                hook_name = hookimpl_opts.get("specname") or attr_name
+                hook: HookCaller | None = getattr(self.hook, hook_name, None)
+                if hook is not None and hook.has_spec():
+                    self._verify_hook(hook, hookimpl)
+                hookimpls.append((hook_name, hookimpl))
+
+            batch_names.append(plugin_name)
+            batch_plugins.append(plugin)
+            prepared.append((plugin_name, plugin, hookimpls))
+
+        # Phase 2: publish all plugins at once.
+        for plugin_name, plugin, hookimpls in prepared:
+            self._name2plugin[plugin_name] = plugin
+            for hook_name, hookimpl in hookimpls:
+                hook = getattr(self.hook, hook_name, None)
+                if hook is None:
+                    hook = HookCaller(hook_name, self._hookexec)
+                    setattr(self.hook, hook_name, hook)
+                hook._add_hookimpl(hookimpl)
+
+        # Phase 3: replay historic calls to the new hook implementations.
+        # This runs user code after the batch is published; exceptions
+        # propagate and the batch stays registered (see docstring).
+        for plugin_name, plugin, hookimpls in prepared:
+            for hook_name, hookimpl in hookimpls:
+                hook = getattr(self.hook, hook_name)
+                hook._maybe_apply_history(hookimpl)
+
+        return batch_names
+
     def unregister(
         self, plugin: _Plugin | None = None, name: str | None = None
     ) -> Any | None:

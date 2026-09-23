@@ -1,0 +1,1 @@
+Add ``PluginManager.register_many()`` for atomic batch registration: all plugins are validated (duplicate names/objects, name conflicts, blocked names and hookspec signature mismatches) before any of them is published, and historic calls are replayed to the new implementations only after the whole batch is registered.
