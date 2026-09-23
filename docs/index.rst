@@ -251,6 +251,31 @@ which has been appropriately marked.
     # load all hookimpls from the local module's namespace
     plugin_name = pm.register(sys.modules[__name__])
 
+.. _register_many:
+
+Registering multiple plugins atomically
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+A set of cooperating plugins can be registered in one shot with
+:py:meth:`~pluggy.PluginManager.register_many()`. The whole batch is
+validated first -- with the same checks as
+:py:meth:`~pluggy.PluginManager.register()` -- and only published if every
+plugin validates, so a single bad plugin can not leave earlier ones
+half-registered:
+
+.. code-block:: python
+
+    pm.register_many([(plugin_a, "a"), (plugin_b, "b"), (plugin_c, "c")])
+
+If any plugin fails validation, an exception identifying the offending
+plugin is raised and the manager is left unchanged. If validation succeeds,
+all plugins are published at once, with the same hook ordering as
+sequential ``register()`` calls, and historic calls are then replayed to
+the new implementations in input order. Should a hook implementation raise
+during that replay, the exception propagates with the batch left
+registered -- pluggy does not roll back external side effects. The
+atomicity guarantee covers synchronous registration only; no cross-thread
+registration safety is provided.
+
 .. _optionalhook:
 
 Optional validation

@@ -240,6 +240,121 @@ class PluginManager:
                 hook._add_hookimpl(hookimpl)
         return plugin_name
 
+    def register_many(self, plugins: Iterable[tuple[_Plugin, str | None]]) -> list[str]:
+        """Register a batch of plugins atomically and return their names.
+
+        :param plugins:
+            An ordered iterable of ``(plugin, name)`` pairs. A ``name`` of
+            ``None`` means a name is generated using
+            :func:`get_canonical_name`, exactly as for
+            :meth:`register(plugin) <PluginManager.register>`.
+
+        :returns:
+            The plugin names, in input order.
+
+        Registration happens in two phases. First, every plugin in the batch
+        is validated -- using the same marker parsing and hookspec checks as
+        :meth:`register` -- without modifying the manager, calling any hook
+        implementation, or replaying historic calls. If any plugin fails
+        validation (a duplicate object or name within the batch, a name
+        which is already registered or blocked, or a hook implementation
+        which does not match its hookspec), an exception identifying the
+        offending plugin is raised and the manager is left exactly as it
+        was: no plugin from the batch is registered, and the name mapping,
+        hookimpl ordering and :meth:`get_plugins` result are unchanged.
+
+        If validation succeeds, all plugins are published at once. The
+        resulting ``tryfirst``/``trylast``/``wrapper`` ordering is identical
+        to calling :meth:`register` for each plugin in input order.
+        Afterwards, historic calls are replayed to the new hook
+        implementations in input order.
+
+        .. note::
+            Historic call replay runs user code *after* the batch has been
+            published. If a hook implementation raises during replay, the
+            exception is propagated as-is and the entire batch remains
+            registered -- pluggy does not attempt to roll back external side
+            effects. Use :meth:`unregister` to remove the plugins if needed.
+
+        .. note::
+            The atomicity guarantee covers synchronous registration only;
+            like the rest of :class:`PluginManager`, no cross-thread
+            registration safety is provided.
+        """
+        # Phase 1: validate the whole batch without mutating any state.
+        pending: list[tuple[str, _Plugin, list[tuple[str, HookImpl]]]] = []
+        batch_names: set[str] = set()
+        batch_plugins: list[_Plugin] = []
+        for plugin, name in plugins:
+            plugin_name = name or self.get_canonical_name(plugin)
+
+            if plugin_name in batch_names:
+                raise ValueError(
+                    "Plugin name registered twice in the same batch: "
+                    f"{plugin_name}={plugin}"
+                )
+            if plugin_name in self._name2plugin:
+                if self._name2plugin.get(plugin_name, -1) is None:
+                    raise ValueError(
+                        f"Plugin name is blocked from registering: "
+                        f"{plugin_name}={plugin}"
+                    )
+                raise ValueError(
+                    "Plugin name already registered: "
+                    f"{plugin_name}={plugin}\n{self._name2plugin}"
+                )
+
+            if plugin in batch_plugins or plugin in self._name2plugin.values():
+                raise ValueError(
+                    "Plugin already registered under a different name: "
+                    f"{plugin_name}={plugin}\n{self._name2plugin}"
+                )
+
+            hookimpls: list[tuple[str, HookImpl]] = []
+            for attr_name in dir(plugin):
+                hookimpl_opts = self.parse_hookimpl_opts(plugin, attr_name)
+                if hookimpl_opts is not None:
+                    normalize_hookimpl_opts(hookimpl_opts)
+                    found = _static_hook_attr(plugin, attr_name)
+                    # Only reachable when a subclass overrode
+                    # parse_hookimpl_opts to claim an attribute pluggy
+                    # cannot bind.
+                    assert found is not None, (
+                        f"{plugin!r}.{attr_name} is not a hookable attribute"
+                    )
+                    method: _HookImplFunction[object] = found[1]
+                    hookimpl = HookImpl(plugin, plugin_name, method, hookimpl_opts)
+                    hook_name = hookimpl_opts.get("specname") or attr_name
+                    hook: HookCaller | None = getattr(self.hook, hook_name, None)
+                    if hook is not None and hook.has_spec():
+                        self._verify_hook(hook, hookimpl)
+                    hookimpls.append((hook_name, hookimpl))
+
+            batch_names.add(plugin_name)
+            batch_plugins.append(plugin)
+            pending.append((plugin_name, plugin, hookimpls))
+
+        # Phase 2: publish all plugins. Adding hookimpls in input order
+        # yields the same ordering as sequential register() calls.
+        for plugin_name, plugin, hookimpls in pending:
+            self._name2plugin[plugin_name] = plugin
+            for hook_name, hookimpl in hookimpls:
+                hook = getattr(self.hook, hook_name, None)
+                if hook is None:
+                    hook = HookCaller(hook_name, self._hookexec)
+                    setattr(self.hook, hook_name, hook)
+                hook._add_hookimpl(hookimpl)
+
+        # Phase 3: replay historic calls to the new hook implementations, in
+        # input order. This runs user code after the batch is published; an
+        # exception here propagates with the batch left registered.
+        for plugin_name, plugin, hookimpls in pending:
+            for hook_name, hookimpl in hookimpls:
+                hook = getattr(self.hook, hook_name)
+                hook._maybe_apply_history(hookimpl)
+
+        return [plugin_name for plugin_name, _, _ in pending]
+
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:
         """Try to obtain a hook implementation from an item with the given name
         in the given plugin which is being searched for hook impls.
