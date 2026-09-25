@@ -371,6 +371,55 @@ For another example see the :ref:`pytest:plugin-hookorder` section of the
     each category.
 
 
+.. _explicit_order:
+
+Explicit ordering between plugins
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Instead of marking every implementation with ``tryfirst``/``trylast``, you
+can declare *this plugin runs before/after that plugin* per hook, by plugin
+name, using :meth:`PluginManager.set_hook_impl_order
+<pluggy.PluginManager.set_hook_impl_order>`:
+
+.. code-block:: python
+
+    pm = PluginManager("myproject")
+    pm.register(plugin_a, name="a")
+    pm.register(plugin_b, name="b")
+    pm.register(plugin_c, name="c")
+
+    pm.hook.setup_project(config=config, args=args)
+    # default (LIFO) order: c, b, a
+
+    # c runs before a, a runs before b
+    pm.set_hook_impl_order("setup_project", before={"c": "a", "a": "b"})
+
+    pm.hook.setup_project(config=config, args=args)
+    # configured order: c, a, b
+
+The constraints only shuffle the *normal* implementations of the given hook:
+``tryfirst``/``trylast`` implementations and :ref:`wrappers <hookwrappers>`
+keep their fixed positions, and referencing them in a constraint is an
+error. Within the normal tier the constraints are resolved by repeatedly
+picking, in the original call order, the next implementation whose
+predecessors have all been placed. ``after={...}`` is accepted as the
+mirror image of ``before={...}``.
+
+The configuration is validated as a whole when set: if a referenced plugin
+is not registered, does not implement the hook, is not a normal
+implementation, or the constraints form a cycle,
+:class:`~pluggy.HookOrderError` is raised naming the involved plugins and
+the previous configuration is kept. The new order takes effect on the
+*next* call of the hook; a call already in progress keeps its fixed order.
+
+If a plugin referenced by the constraints is unregistered, the
+configuration becomes invalid and the next call of the hook raises
+:class:`~pluggy.HookOrderError` instead of silently dropping the
+constraint. Fix it with another ``set_hook_impl_order()`` call or remove
+it with :meth:`PluginManager.clear_hook_impl_order
+<pluggy.PluginManager.clear_hook_impl_order>`.
+
+
 .. _hookwrappers:
 
 Wrappers

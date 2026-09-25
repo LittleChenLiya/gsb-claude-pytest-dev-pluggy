@@ -12,6 +12,10 @@ API Reference
     :show-inheritance:
     :members:
 
+.. autoclass:: pluggy.HookOrderError()
+    :show-inheritance:
+    :members:
+
 .. autodecorator:: pluggy.HookspecMarker
 
 .. autodecorator:: pluggy.HookimplMarker

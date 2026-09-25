@@ -38,6 +38,14 @@ _HookExec: TypeAlias = Callable[
 _HookImplFunction: TypeAlias = Callable[..., _T | Generator[None, Result[_T], None]]
 
 
+class HookOrderError(ValueError):
+    """Raised when hook implementation ordering constraints are invalid.
+
+    See :meth:`PluginManager.set_hook_impl_order
+    <pluggy.PluginManager.set_hook_impl_order>`.
+    """
+
+
 class HookspecOpts(TypedDict):
     """Options for a hook specification."""
 
@@ -407,6 +415,62 @@ _CallHistory: TypeAlias = list[
 ]
 
 
+def _is_orderable(hookimpl: HookImpl) -> bool:
+    """Whether a hookimpl participates in explicit ordering constraints.
+
+    Only "normal" implementations are orderable: wrappers and
+    tryfirst/trylast implementations keep their fixed tiers.
+    """
+    return not (
+        hookimpl.wrapper
+        or hookimpl.hookwrapper
+        or hookimpl.tryfirst
+        or hookimpl.trylast
+    )
+
+
+def _apply_order_constraints(
+    hookimpls: list[HookImpl],
+    constraints: Mapping[str, AbstractSet[str]],
+) -> list[HookImpl]:
+    """Stable topological sort of ``hookimpls`` according to ``constraints``.
+
+    ``constraints`` maps a plugin name to the plugin names it must run
+    *before*. Repeatedly picks the first hookimpl (in the current call
+    order) whose predecessors have all been placed already. Edges which
+    reference plugin names not present in ``hookimpls`` are ignored here;
+    dangling constraints are reported separately before the hook call.
+    """
+    present = {hookimpl.plugin_name for hookimpl in hookimpls}
+    predecessors: dict[str, set[str]] = {}
+    for name, afters in constraints.items():
+        if name not in present:
+            continue
+        for after in afters:
+            if after in present:
+                predecessors.setdefault(after, set()).add(name)
+    # The hookimpls list is iterated in reverse at call time, so work in
+    # call order and reverse the result back into list order.
+    remaining = list(reversed(hookimpls))
+    placed: set[str] = set()
+    result: list[HookImpl] = []
+    while remaining:
+        for hookimpl in remaining:
+            if predecessors.get(hookimpl.plugin_name, set()) <= placed:
+                remaining.remove(hookimpl)
+                placed.add(hookimpl.plugin_name)
+                result.append(hookimpl)
+                break
+        else:
+            # Unresolvable (cyclic) remainder; cannot happen for validated
+            # constraints, but keep the original relative order as a
+            # fallback rather than failing here.
+            result.extend(remaining)
+            break
+    result.reverse()
+    return result
+
+
 class HookCaller:
     """A caller of all registered implementations of a hook specification."""
 
@@ -414,6 +478,7 @@ class HookCaller:
         "_call_history",
         "_hookexec",
         "_hookimpls",
+        "_order_constraints",
         "name",
         "spec",
     )
@@ -438,6 +503,10 @@ class HookCaller:
         # 6. tryfirst wrappers
         self._hookimpls: Final[list[HookImpl]] = []
         self._call_history: _CallHistory | None = None
+        # Ordering constraints for "normal" hookimpls, mapping a plugin
+        # name to the plugin names it must run before. Set through
+        # PluginManager.set_hook_impl_order().
+        self._order_constraints: dict[str, frozenset[str]] = {}
         # TODO: Document, or make private.
         self.spec: HookSpec | None = None
         if specmodule_or_class is not None:
@@ -473,6 +542,7 @@ class HookCaller:
         if len(remaining) == len(self._hookimpls):
             raise ValueError(f"plugin {plugin!r} not found")
         self._hookimpls[:] = remaining
+        self._reorder_hookimpls()
 
     def get_hookimpls(self) -> list[HookImpl]:
         """Get all registered hook implementations for this hook."""
@@ -501,6 +571,65 @@ class HookCaller:
             while i >= start and self._hookimpls[i].tryfirst:
                 i -= 1
             self._hookimpls.insert(i + 1, hookimpl)
+        self._reorder_hookimpls()
+
+    def _set_order_constraints(self, constraints: Mapping[str, frozenset[str]]) -> None:
+        """Replace the ordering constraints and reorder the hookimpls.
+
+        Only to be called with constraints already validated by
+        :meth:`PluginManager.set_hook_impl_order
+        <pluggy.PluginManager.set_hook_impl_order>`.
+        """
+        self._order_constraints = dict(constraints)
+        self._reorder_hookimpls()
+
+    def _get_order_constraints(self) -> dict[str, frozenset[str]]:
+        """Return a copy of the current ordering constraints."""
+        return dict(self._order_constraints)
+
+    def _reorder_hookimpls(self) -> None:
+        """Re-apply the ordering constraints to the "normal" hookimpls.
+
+        Only hookimpls which are not wrappers and not marked tryfirst/
+        trylast participate; the fixed tiers are left untouched.
+        """
+        if not self._order_constraints:
+            return
+        positions = [
+            i for i, hookimpl in enumerate(self._hookimpls) if _is_orderable(hookimpl)
+        ]
+        if len(positions) < 2:
+            return
+        segment = [self._hookimpls[i] for i in positions]
+        ordered = _apply_order_constraints(segment, self._order_constraints)
+        for i, hookimpl in zip(positions, ordered):
+            self._hookimpls[i] = hookimpl
+
+    def _check_order_constraints(self) -> None:
+        """Verify that all ordering constraints still reference plugins
+        which implement this hook.
+
+        Raises :class:`HookOrderError` if a constraint references a plugin
+        which has been unregistered (or otherwise no longer implements
+        this hook), instead of silently dropping the constraint.
+        """
+        if not self._order_constraints:
+            return
+        present = {hookimpl.plugin_name for hookimpl in self._hookimpls}
+        missing = {name for name in self._order_constraints if name not in present} | {
+            after
+            for afters in self._order_constraints.values()
+            for after in afters
+            if after not in present
+        }
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise HookOrderError(
+                f"hook {self.name!r} has ordering constraints referencing "
+                f"plugin(s) which no longer implement it: {names}. "
+                "Fix the ordering with PluginManager.set_hook_impl_order() "
+                "or clear it with PluginManager.clear_hook_impl_order()."
+            )
 
     def __repr__(self) -> str:
         return f"<HookCaller {self.name!r}>"
@@ -540,6 +669,7 @@ class HookCaller:
             "Cannot directly call a historic hook - use call_historic instead."
         )
         self._verify_all_args_are_provided(kwargs)
+        self._check_order_constraints()
         firstresult = self.spec.opts.get("firstresult", False) if self.spec else False
         # Copy because plugins may register other plugins during iteration (#438).
         return self._hookexec(self.name, self._hookimpls.copy(), kwargs, firstresult)
@@ -560,6 +690,7 @@ class HookCaller:
         assert self._call_history is not None
         kwargs = kwargs or {}
         self._verify_all_args_are_provided(kwargs)
+        self._check_order_constraints()
         self._call_history.append((kwargs, result_callback))
         # Historizing hooks don't return results.
         # Remember firstresult isn't compatible with historic.
@@ -581,6 +712,7 @@ class HookCaller:
             "Cannot directly call a historic hook - use call_historic instead."
         )
         self._verify_all_args_are_provided(kwargs)
+        self._check_order_constraints()
         opts: HookimplOpts = {
             "wrapper": False,
             "hookwrapper": False,
@@ -653,6 +785,10 @@ class _SubsetHookCaller(HookCaller):
             for impl in self._orig._hookimpls
             if impl.plugin not in self._remove_plugins
         ]
+
+    @property
+    def _order_constraints(self) -> dict[str, frozenset[str]]:  # type: ignore[override]
+        return self._orig._order_constraints
 
     @property
     def spec(self) -> HookSpec | None:  # type: ignore[override]
