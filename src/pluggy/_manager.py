@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+from contextlib import contextmanager
+import contextvars
 import inspect
 import types
 from typing import Any
@@ -171,6 +174,14 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        # Names of plugins locally blocked via `without_plugins`. A
+        # ContextVar, so the blocking scope follows the current thread or
+        # asyncio task instead of the global registry.
+        self._locally_blocked: Final[contextvars.ContextVar[frozenset[str]]] = (
+            contextvars.ContextVar(
+                f"pluggy-{project_name}-locally-blocked", default=frozenset()
+            )
+        )
 
     def _hookexec(
         self,
@@ -181,7 +192,60 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
+        blocked = self._locally_blocked.get()
+        if blocked:
+            # Snapshot the locally blocked names at hook-call entry; the
+            # filtered list is used for the entire call, including wrapper
+            # teardowns, so a consistent view is kept throughout.
+            methods = [impl for impl in methods if impl.plugin_name not in blocked]
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+
+    @contextmanager
+    def without_plugins(self, names: str | Iterable[str]) -> Iterator[None]:
+        """Locally block plugins by name for hook calls in this context.
+
+        :param names:
+            A plugin name or an iterable of plugin names to block. All names
+            must belong to currently registered plugins, otherwise a
+            :exc:`ValueError` is raised immediately when entering the context.
+
+        Within the context, hook calls skip the hook implementations of the
+        named plugins, as if they were not registered. On exit, the previous
+        state is restored. The global plugin registry is not modified in any
+        way - the plugins stay registered and keep their hook implementations.
+
+        The blocking scope follows the current execution context
+        (:mod:`contextvars`): it applies to the current thread or asyncio
+        task. Tasks created inside the context inherit the blocked names as of
+        their creation; later exits of the context in the parent do not affect
+        them.
+
+        Nested `without_plugins` contexts combine: the inner scope blocks
+        the union of its own names and the outer scopes' names.
+
+        The set of blocked names is snapshotted when a hook call is entered,
+        so all hook implementations and wrappers (old-style `hookwrapper`
+        and new-style `wrapper`) of a single call - including their
+        teardown code - observe the same filtering.
+
+        .. versionadded:: 1.7
+        """
+        if isinstance(names, str):
+            names = (names,)
+        blocked = frozenset(names)
+        unknown = sorted(
+            name for name in blocked if self._name2plugin.get(name) is None
+        )
+        if unknown:
+            raise ValueError(
+                "cannot block unknown plugin name(s): "
+                + ", ".join(repr(name) for name in unknown)
+            )
+        token = self._locally_blocked.set(self._locally_blocked.get() | blocked)
+        try:
+            yield
+        finally:
+            self._locally_blocked.reset(token)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.

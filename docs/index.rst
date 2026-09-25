@@ -750,6 +750,27 @@ You can block any plugin from being registered using
 :py:meth:`~pluggy.PluginManager.set_blocked()` and check if a given
 *plugin* is blocked by name using :py:meth:`~pluggy.PluginManager.is_blocked()`.
 
+.. _local_blocking:
+
+Temporarily blocking plugins
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+While :py:meth:`~pluggy.PluginManager.set_blocked()` prevents registration
+entirely, :py:meth:`~pluggy.PluginManager.without_plugins()` blocks
+already-registered plugins by name only for hook calls made within its
+scope::
+
+    with pm.without_plugins({"spam"}):
+        pm.hook.myhook(...)  # hookimpls of "spam" are skipped here
+    pm.hook.myhook(...)  # "spam" participates again
+
+The global plugin registry is not modified: the plugins stay registered and
+resume participating as soon as the context is exited. The scope follows the
+current thread or :mod:`asyncio` task (via :mod:`contextvars`), so
+concurrent contexts in different threads or tasks do not affect each other,
+and tasks created inside the scope inherit the blocked names as of their
+creation. Nested scopes block the union of their names. Blocking an unknown
+plugin name raises :exc:`ValueError` when the context is entered.
+
 
 Inspection
 ----------

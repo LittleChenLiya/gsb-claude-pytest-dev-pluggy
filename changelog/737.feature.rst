@@ -1,0 +1,5 @@
+Added :meth:`PluginManager.without_plugins() <pluggy.PluginManager.without_plugins>`,
+a context manager which locally blocks plugins by name for hook calls within
+its scope, without modifying the global plugin registry. The scope follows the
+current thread or asyncio task, and nested scopes block the union of their
+names.
