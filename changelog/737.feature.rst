@@ -1,0 +1,3 @@
+Added :meth:`pluggy.PluginManager.disabled_plugins`, a context manager which
+temporarily disables plugins by name for hook calls made in the current
+thread or async task, without modifying the global plugin registry.

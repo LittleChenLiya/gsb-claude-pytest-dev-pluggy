@@ -975,6 +975,44 @@ You then can use that :py:class:`~pluggy.HookCaller`
 to make normal, :py:meth:`~pluggy.HookCaller.call_historic`, or
 :py:meth:`~pluggy.HookCaller.call_extra` calls as necessary.
 
+.. _disabled_plugins:
+
+Temporarily disabling plugins
+-----------------------------
+You can disable plugins by name for the dynamic extent of a ``with`` block
+using the :py:meth:`pluggy.PluginManager.disabled_plugins()` context manager:
+
+.. code-block:: python
+
+    with pm.disabled_plugins({"plugin-b"}):
+        # hook calls in this block skip all hookimpls from 'plugin-b',
+        # including its hook wrappers
+        pm.hook.myhook(config=config, args=args)
+
+    # 'plugin-b' participates again once the block is exited
+    pm.hook.myhook(config=config, args=args)
+
+Unlike :py:meth:`~pluggy.PluginManager.unregister`, this does not modify the
+plugin registry; the previous state is restored when the block exits, even
+if an exception is raised. Nested blocks combine, so an inner block disables
+the union of its own names and the names disabled by enclosing blocks.
+
+The disabling follows the current thread or :std:doc:`asyncio <python:library/asyncio>`
+task (it is backed by a :py:class:`contextvars.ContextVar`): it does not leak
+into other threads, and an async task created inside the block inherits a
+snapshot of the disabled names as of its creation, unaffected by the parent
+later exiting the block.
+
+The filtering is snapshotted when each hook call is entered, so the teardown
+phase of :ref:`wrappers <hookwrappers>` which are still enabled always runs,
+even if a hook implementation enters and exits a ``disabled_plugins`` block
+in the middle of the call.
+
+Passing a name which is not a currently registered plugin raises a
+:py:exc:`ValueError` immediately.
+
+.. versionadded:: 1.7
+
 
 .. _tracing:
 

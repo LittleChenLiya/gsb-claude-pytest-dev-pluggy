@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from collections.abc import Iterable
+from collections.abc import Iterator
 from collections.abc import Mapping
 from collections.abc import Sequence
+import contextlib
+import contextvars
 import inspect
 import types
 from typing import Any
@@ -171,6 +174,15 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        # Names of plugins temporarily disabled in the current context, see
+        # disabled_plugins(). A ContextVar gives each thread and async task
+        # its own view; new async tasks inherit a snapshot of the context
+        # active at their creation.
+        self._disabled_plugins: Final[contextvars.ContextVar[frozenset[str]]] = (
+            contextvars.ContextVar(
+                f"pluggy-disabled-plugins-{project_name}", default=frozenset()
+            )
+        )
 
     def _hookexec(
         self,
@@ -181,7 +193,57 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
+        disabled = self._disabled_plugins.get()
+        if disabled:
+            # Snapshot the filtering once, at call entry: the same filtered
+            # list drives the entire call, including the teardown phase of
+            # old-style hookwrappers and new-style wrappers, so a still
+            # enabled wrapper's post-yield code is never skipped and nested
+            # scopes entered during the call don't affect this call.
+            methods = [
+                hookimpl for hookimpl in methods if hookimpl.plugin_name not in disabled
+            ]
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+
+    @contextlib.contextmanager
+    def disabled_plugins(self, names: Iterable[str]) -> Iterator[None]:
+        """Context manager to temporarily disable plugins by name.
+
+        Within the ``with`` block, hook calls made in the current context
+        skip all hook implementations (including :ref:`wrappers
+        <hookwrappers>`) provided by the plugins registered under the given
+        ``names``. The plugin registry itself is not modified - unlike
+        :meth:`unregister`, the effect is local to the dynamic scope of the
+        ``with`` block and the previous state is restored on exit.
+
+        Nested ``disabled_plugins`` blocks combine: the inner block disables
+        the union of its own names and the names disabled by enclosing
+        blocks.
+
+        The disabling follows the current thread or :mod:`asyncio` task
+        (via :class:`contextvars.ContextVar`): it does not leak into other
+        threads, and an async task created inside the block inherits a
+        snapshot of the disabled names as of its creation, unaffected by
+        the parent later exiting the block.
+
+        :param names:
+            Names of currently registered plugins to disable. Unknown
+            (or blocked) plugin names raise a :exc:`ValueError` immediately.
+
+        .. versionadded:: 1.7
+        """
+        names = frozenset(names)
+        unknown = [name for name in names if self._name2plugin.get(name) is None]
+        if unknown:
+            raise ValueError(
+                "Cannot disable unknown or blocked plugin name(s): "
+                + ", ".join(sorted(unknown))
+            )
+        token = self._disabled_plugins.set(self._disabled_plugins.get() | names)
+        try:
+            yield
+        finally:
+            self._disabled_plugins.reset(token)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.
