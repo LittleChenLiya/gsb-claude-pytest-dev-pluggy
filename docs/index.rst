@@ -976,6 +976,42 @@ to make normal, :py:meth:`~pluggy.HookCaller.call_historic`, or
 :py:meth:`~pluggy.HookCaller.call_extra` calls as necessary.
 
 
+.. _recursion_protection:
+
+Recursion protection
+--------------------
+Plugins which call hooks from within hook implementations can accidentally
+create unbounded call chains, for example when ``hook_a`` ends up
+calling ``hook_a`` again (directly or via other hooks). To guard
+against this,
+:py:meth:`~pluggy.PluginManager.enable_recursion_protection()`
+installs an optional, opt-in guard which tracks the hook call stack of the
+current context -- recording the hook name, the implementing plugins and
+the depth of each call:
+
+.. code-block:: python
+
+    undo = pm.enable_recursion_protection(
+        max_depth=100,  # limit the total depth of nested hook calls
+        no_reentry={"myhook"},  # forbid direct/indirect re-entry of myhook
+    )
+
+When a limit is violated, a :py:exc:`~pluggy.HookRecursionError` is
+raised. The exception carries a ``call_ring`` attribute with the
+:py:class:`~pluggy.HookCallFrame` entries of the offending call
+chain. Long chains are trimmed to ``max_ring_entries`` entries, but
+the first re-entry point and the final triggering call are always
+preserved.
+
+The call stack is local to the current thread or asyncio task, so the same
+hook called concurrently in independent contexts is not mistaken for
+recursion. The stack is cleaned up consistently no matter how a call ends --
+normal return, :ref:`firstresult` early exit, wrapper teardown
+exceptions or :ref:`historic` replay -- and wrappers always unwind in
+the order they were entered. The protection is disabled by default; calling
+the returned ``undo`` function removes it again.
+
+
 .. _tracing:
 
 Built-in tracing

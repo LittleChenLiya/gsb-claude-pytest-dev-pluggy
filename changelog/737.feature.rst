@@ -1,0 +1,9 @@
+Add optional hook recursion protection via
+``PluginManager.enable_recursion_protection()``.
+When enabled, hook calls are tracked in a per-call-context stack (recording
+hook name, implementing plugins and depth), the total depth of a call chain
+can be limited with ``max_depth``, and selected hooks can be declared
+non-reentrant with ``no_reentry``. Violations raise the new
+``pluggy.HookRecursionError``, which carries a trimmed call ring that
+always preserves the first re-entry point and the final triggering call.
+The protection is disabled by default.

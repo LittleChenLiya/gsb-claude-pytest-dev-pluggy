@@ -33,6 +33,13 @@ API Reference
     :show-inheritance:
     :members:
 
+.. autoclass:: pluggy.HookRecursionError()
+    :show-inheritance:
+    :members:
+
+.. autoclass:: pluggy.HookCallFrame()
+    :members:
+
 .. autoclass:: pluggy.Result()
     :show-inheritance:
     :members:
