@@ -371,6 +371,50 @@ For another example see the :ref:`pytest:plugin-hookorder` section of the
     each category.
 
 
+.. _implorder:
+
+Ordering implementations by plugin name
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. versionadded:: 1.7
+
+When several plugins provide a regular implementation of the same hook and
+competing for ``tryfirst``/``trylast`` is not enough,
+:meth:`PluginManager.set_hookimpl_order` orders the regular implementations
+of one hook relative to each other, by plugin name:
+
+.. code-block:: python
+
+    pm.set_hookimpl_order(
+        "myhook",
+        before={"c": "a", "a": "b"},  # c runs before a, a runs before b
+    )
+
+``before`` maps a plugin name to the plugin name (or names) it must run
+before; ``after`` is the same relation spelled the other way around. The
+constraints are resolved with a stable topological sort: whenever several
+implementations have no remaining prerequisites, the one which comes first
+in the default call order is picked next, so plugins not mentioned in any
+constraint keep their usual relative order.
+
+Only regular implementations take part: ``tryfirst``/``trylast``
+implementations and :ref:`wrappers <hookwrappers>` keep their fixed
+positions, a constraint can never move an implementation into another tier,
+and :ref:`firstresult` hooks keep stopping at the first non-``None`` result.
+
+The configuration is validated atomically: if a referenced plugin is not
+registered, does not implement the hook, is not a regular implementation of
+it, or the constraints form a cycle, :exc:`pluggy.HookOrderingError` is
+raised naming the plugins involved, and the previously working configuration
+stays in effect. The order of a hook call is fixed once the call starts, so
+changing the configuration during a call only affects the next call. If a
+referenced plugin is later unregistered, the configuration is marked invalid
+and the next call of the hook raises :exc:`pluggy.HookOrderingError` instead
+of silently ignoring the constraints; set a new ordering (or clear it by
+calling ``set_hookimpl_order`` without constraints) to make the hook
+callable again.
+
+
 .. _hookwrappers:
 
 Wrappers

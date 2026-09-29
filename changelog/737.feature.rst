@@ -1,0 +1,8 @@
+Add :meth:`pluggy.PluginManager.set_hookimpl_order`, which orders the regular
+implementations of a hook relative to each other by plugin name
+(``before``/``after`` constraints), so plugins no longer need to compete for
+``tryfirst``/``trylast``. Invalid configurations (unknown or non-implementing
+plugins, cross-tier constraints, cycles) raise
+:exc:`pluggy.HookOrderingError` and leave the previous configuration in
+effect; unregistering a referenced plugin invalidates the configuration
+loudly instead of silently dropping the constraints.

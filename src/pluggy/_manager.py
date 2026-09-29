@@ -139,6 +139,56 @@ class PluginValidationError(Exception):
         self.plugin = plugin
 
 
+class HookOrderingError(ValueError):
+    """Hook implementation ordering configuration is invalid.
+
+    Raised by :meth:`PluginManager.set_hookimpl_order` when the requested
+    ordering cannot be applied, and when a hook is called while its ordering
+    configuration is invalidated, for example because a plugin referenced by
+    the configuration has been unregistered.
+    """
+
+
+def _as_name_list(value: str | Iterable[str]) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    return list(value)
+
+
+def _find_ordering_cycle(
+    constraints: Iterable[tuple[str, str]],
+) -> list[str] | None:
+    """Return a cycle (as a list of plugin names) in the given ordering
+    constraints, or None if the constraints are acyclic."""
+    graph: dict[str, list[str]] = {}
+    for earlier, later in constraints:
+        graph.setdefault(earlier, []).append(later)
+        graph.setdefault(later, [])
+    state: dict[str, int] = {}  # 1 = on the current path, 2 = fully explored
+    path: list[str] = []
+
+    def visit(name: str) -> list[str] | None:
+        state[name] = 1
+        path.append(name)
+        for next_name in graph[name]:
+            if state.get(next_name) == 1:
+                return path[path.index(next_name) :] + [next_name]
+            if state.get(next_name) is None:
+                cycle = visit(next_name)
+                if cycle is not None:
+                    return cycle
+        path.pop()
+        state[name] = 2
+        return None
+
+    for name in graph:
+        if state.get(name) is None:
+            cycle = visit(name)
+            if cycle is not None:
+                return cycle
+    return None
+
+
 class PluginManager:
     """Core class which manages registration of plugin objects and 1:N hook
     calling.
@@ -171,6 +221,12 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        # Ordering constraints per hook name, as (earlier, later) plugin
+        # name pairs; see set_hookimpl_order().
+        self._hook_orderings: Final[dict[str, tuple[tuple[str, str], ...]]] = {}
+        # Hook names whose ordering configuration references plugins which
+        # are no longer registered, mapped to the missing plugin names.
+        self._invalid_hook_orderings: Final[dict[str, list[str]]] = {}
 
     def _hookexec(
         self,
@@ -181,6 +237,15 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
+        missing = self._invalid_hook_orderings.get(hook_name)
+        if missing is not None:
+            raise HookOrderingError(
+                f"cannot call hook {hook_name!r}: the hook implementation "
+                f"ordering references unregistered plugin(s) "
+                f"{', '.join(repr(name) for name in missing)}; "
+                "re-set the ordering with PluginManager.set_hookimpl_order() "
+                "to make this hook callable again"
+            )
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
@@ -293,7 +358,184 @@ class PluginManager:
             assert name is not None
             del self._name2plugin[name]
 
+        if self._hook_orderings:
+            self._invalidate_hook_orderings(name)
+
         return plugin
+
+    def set_hookimpl_order(
+        self,
+        hook_name: str,
+        *,
+        before: Mapping[str, str | Iterable[str]] | None = None,
+        after: Mapping[str, str | Iterable[str]] | None = None,
+    ) -> None:
+        """Set the relative call order of the regular hook implementations
+        of the hook ``hook_name``, by plugin name.
+
+        :param hook_name:
+            The name of the hook whose implementations should be ordered.
+        :param before:
+            A mapping of a plugin name to a plugin name (or iterable of
+            plugin names) it must be called before.
+        :param after:
+            A mapping of a plugin name to a plugin name (or iterable of
+            plugin names) it must be called after; the same relation as
+            ``before``, spelled the other way around.
+
+        The constraints only apply to *regular* hook implementations:
+        ``tryfirst``/``trylast`` implementations and wrappers keep their
+        fixed positions in the call order, and a constraint can never move
+        an implementation into another tier. Constraints are resolved with
+        a stable topological sort: whenever several implementations have no
+        remaining prerequisites, the one which comes first in the default
+        call order is picked next, so implementations not mentioned in any
+        constraint keep their usual relative order. ``firstresult`` hooks
+        keep stopping at the first non-``None`` result.
+
+        The configuration is validated atomically: if a referenced plugin
+        is not registered, does not implement this hook, is not a regular
+        implementation of it, or the constraints form a cycle,
+        :exc:`HookOrderingError` is raised naming the plugins involved and
+        the previously working configuration (if any) stays in effect.
+
+        The order of a hook call is fixed once the call starts, so changing
+        the configuration during a call only affects the next call.
+
+        If a plugin referenced by the configuration is later unregistered,
+        the configuration is marked invalid and the next call of the hook
+        raises :exc:`HookOrderingError` instead of silently ignoring the
+        constraints. Set a new ordering (or clear it by calling this method
+        without constraints) to make the hook callable again.
+
+        .. versionadded:: 1.7
+        """
+        constraints: list[tuple[str, str]] = []
+        if before:
+            for name, targets in before.items():
+                for target in _as_name_list(targets):
+                    constraints.append((name, target))
+        if after:
+            for name, targets in after.items():
+                for target in _as_name_list(targets):
+                    constraints.append((target, name))
+
+        if not constraints:
+            # Clearing the ordering is always allowed.
+            self._hook_orderings.pop(hook_name, None)
+            self._invalid_hook_orderings.pop(hook_name, None)
+            return
+
+        hook: HookCaller | None = getattr(self.hook, hook_name, None)
+        if hook is None:
+            raise HookOrderingError(
+                f"cannot set hook implementation order: unknown hook {hook_name!r}"
+            )
+
+        # Partition the hook's implementations: ordering constraints only
+        # apply to regular implementations (not tryfirst/trylast, not
+        # wrappers), which form the middle tier of the call order.
+        regular: dict[str, list[HookImpl]] = {}
+        special: dict[str, HookImpl] = {}
+        for impl in hook.get_hookimpls():
+            if impl.tryfirst or impl.trylast or impl.wrapper or impl.hookwrapper:
+                special.setdefault(impl.plugin_name, impl)
+            else:
+                regular.setdefault(impl.plugin_name, []).append(impl)
+
+        # Validate all referenced names before changing any state, so a
+        # failed configuration leaves the previously working one in place.
+        for earlier, later in constraints:
+            for name in (earlier, later):
+                if name in regular:
+                    continue
+                if name in special:
+                    raise HookOrderingError(
+                        f"cannot order hook {hook_name!r}: plugin {name!r} "
+                        "uses tryfirst/trylast or a wrapper for this hook; "
+                        "ordering constraints only apply to regular "
+                        "implementations, which stay in their own tier"
+                    )
+                if not self.has_plugin(name):
+                    raise HookOrderingError(
+                        f"cannot order hook {hook_name!r}: plugin {name!r} "
+                        "is not registered"
+                    )
+                raise HookOrderingError(
+                    f"cannot order hook {hook_name!r}: plugin {name!r} "
+                    "does not implement this hook"
+                )
+
+        cycle = _find_ordering_cycle(constraints)
+        if cycle is not None:
+            raise HookOrderingError(
+                f"cannot order hook {hook_name!r}: ordering constraints form "
+                f"a cycle: {' -> '.join(repr(name) for name in cycle)}"
+            )
+
+        self._hook_orderings[hook_name] = tuple(constraints)
+        self._invalid_hook_orderings.pop(hook_name, None)
+        self._apply_hookimpl_order(hook, constraints)
+
+    def _apply_hookimpl_order(
+        self, hook: HookCaller, constraints: Iterable[tuple[str, str]]
+    ) -> None:
+        """Reorder the regular implementations of ``hook`` in place
+        according to the given (already validated) constraints."""
+        impls = hook._hookimpls
+        indices = [
+            i
+            for i, impl in enumerate(impls)
+            if not (impl.tryfirst or impl.trylast or impl.wrapper or impl.hookwrapper)
+        ]
+        if len(indices) < 2:
+            return
+        # The caller iterates the list in reverse, so the execution order
+        # is the reverse of the list order.
+        execution = [impls[i] for i in reversed(indices)]
+        by_plugin: dict[str, list[HookImpl]] = {}
+        for impl in execution:
+            by_plugin.setdefault(impl.plugin_name, []).append(impl)
+        indegree = {impl: 0 for impl in execution}
+        followers: dict[HookImpl, list[HookImpl]] = {impl: [] for impl in execution}
+        for earlier, later in constraints:
+            for src in by_plugin[earlier]:
+                for dst in by_plugin[later]:
+                    if dst not in followers[src]:
+                        followers[src].append(dst)
+                        indegree[dst] += 1
+        position = {impl: pos for pos, impl in enumerate(execution)}
+        # Kahn's algorithm: repeatedly pick, among the implementations with
+        # no remaining prerequisites, the one which comes first in the
+        # original call order.
+        ready = [impl for impl in execution if indegree[impl] == 0]
+        ordered: list[HookImpl] = []
+        while ready:
+            impl = ready.pop(0)
+            ordered.append(impl)
+            for follower in followers[impl]:
+                indegree[follower] -= 1
+                if indegree[follower] == 0:
+                    ready.append(follower)
+            ready.sort(key=position.__getitem__)
+        if len(ordered) != len(execution):  # pragma: no cover
+            # Unreachable: constraints are validated to be acyclic above.
+            raise HookOrderingError(
+                f"cannot order hook {hook.name!r}: ordering constraints form a cycle"
+            )
+        # Write back: list order is the reverse of the execution order.
+        for i, impl in zip(indices, reversed(ordered)):
+            impls[i] = impl
+
+    def _invalidate_hook_orderings(self, plugin_name: str) -> None:
+        """Mark ordering configurations which reference ``plugin_name`` as
+        invalid, so the affected hooks fail loudly instead of silently
+        ignoring the constraints."""
+        for hook_name, constraints in self._hook_orderings.items():
+            if any(plugin_name in pair for pair in constraints):
+                missing = self._invalid_hook_orderings.setdefault(hook_name, [])
+                if plugin_name not in missing:
+                    missing.append(plugin_name)
 
     def set_blocked(self, name: str) -> None:
         """Block registrations of the given name, unregister if already registered."""
