@@ -1,7 +1,9 @@
 __all__ = [
     "HookCallError",
+    "HookCallFrame",
     "HookCaller",
     "HookImpl",
+    "HookRecursionError",
     "HookRelay",
     "HookimplMarker",
     "HookimplOpts",
@@ -23,6 +25,8 @@ from ._hooks import HookspecMarker
 from ._hooks import HookspecOpts
 from ._manager import PluginManager
 from ._manager import PluginValidationError
+from ._recursion import HookCallFrame
+from ._recursion import HookRecursionError
 from ._result import HookCallError
 from ._result import Result
 from ._warnings import PluggyTeardownRaisedWarning

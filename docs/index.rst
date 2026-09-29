@@ -1015,6 +1015,45 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+.. _recursion_guard:
+
+Recursion protection
+********************
+By default ``pluggy`` does not restrict how hooks call other hooks: a
+*hookimpl* may freely call back into the same or another hook. If your
+application needs protection against runaway or cyclic hook calls, you
+can opt in to recursion protection with
+:py:meth:`pluggy.PluginManager.enable_recursion_guard()`:
+
+.. code-block:: python
+
+    pm = PluginManager("myproject")
+    undo = pm.enable_recursion_guard(
+        max_depth=50,  # reject chains nested deeper than this
+        no_reentry={"my_hook"},  # forbid direct/indirect re-entry of my_hook
+    )
+
+While enabled, every hook call is recorded in a per-context call chain
+(hook name, implementing plugins and depth). A call which would exceed
+``max_depth`` or re-enter a hook named in ``no_reentry`` is rejected with
+a :py:class:`pluggy.HookRecursionError`. The exception carries the
+(trimmed) call chain in its
+:py:attr:`~pluggy.HookRecursionError.call_chain` attribute and in its
+message, for example::
+
+    hook 'my_hook' may not be re-entered directly or indirectly; call chain:
+    #1 my_hook (plugin_a) -> #2 other_hook (plugin_b) -> #3 my_hook (plugin_a)
+
+The chain is tracked with :mod:`contextvars`, so independent call chains
+in other threads or async tasks are never mistaken for recursion, and it
+is cleaned up consistently on all exit paths -- including ``firstresult``
+early exits, :ref:`historic <historic>` hook replays and exceptions --
+while hook wrappers still unwind in the order they were entered.
+
+The method returns an undo function; calling it (or
+:py:meth:`pluggy.PluginManager.disable_recursion_guard()`) disables the
+protection again.
+
 Public API
 **********
 Please see the :doc:`api_reference`.

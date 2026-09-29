@@ -25,6 +25,8 @@ from ._hooks import HookimplOpts
 from ._hooks import HookRelay
 from ._hooks import HookspecOpts
 from ._hooks import normalize_hookimpl_opts
+from ._recursion import _RecursionGuard
+from ._recursion import DEFAULT_MAX_DEPTH
 from ._result import Result
 
 
@@ -171,6 +173,7 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        self._recursion_guard: _RecursionGuard | None = None
 
     def _hookexec(
         self,
@@ -181,7 +184,68 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
+        guard = self._recursion_guard
+        if guard is not None:
+            return guard.hookexec(
+                hook_name, methods, kwargs, firstresult, self._inner_hookexec
+            )
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+
+    def enable_recursion_guard(
+        self,
+        *,
+        max_depth: int = DEFAULT_MAX_DEPTH,
+        no_reentry: Iterable[str] = (),
+    ) -> Callable[[], None]:
+        """Enable optional hook recursion protection.
+
+        When enabled, every hook call is tracked in a per-context call
+        chain (recording hook name, implementing plugins and depth) and
+        checked before execution:
+
+        - If the total nesting depth of the current call chain would
+          exceed ``max_depth``, the call is rejected.
+        - If a hook named in ``no_reentry`` is re-entered, directly or
+          indirectly, within the current call chain, the call is rejected.
+
+        Rejected calls raise :class:`~pluggy.HookRecursionError`, which
+        carries the (trimmed) call chain leading to the violation.
+
+        The tracking is based on :mod:`contextvars`, so independent call
+        chains in other threads or async tasks are never mistaken for
+        recursion. The chain is cleaned up consistently on all exit paths,
+        including ``firstresult`` early exits, historic hook replays and
+        exceptions, and hook wrappers still unwind in the order they were
+        entered.
+
+        The guard is disabled by default.
+
+        :param max_depth:
+            Maximum total depth of nested hook calls within one call chain.
+        :param no_reentry:
+            Names of hooks which may not be re-entered directly or
+            indirectly while a call of the same hook is still in progress.
+
+        :returns:
+            An undo function which, when called, disables the guard.
+
+        .. versionadded:: 1.7
+        """
+        self._recursion_guard = _RecursionGuard(
+            max_depth=max_depth, no_reentry=no_reentry
+        )
+
+        def undo() -> None:
+            self.disable_recursion_guard()
+
+        return undo
+
+    def disable_recursion_guard(self) -> None:
+        """Disable hook recursion protection.
+
+        .. versionadded:: 1.7
+        """
+        self._recursion_guard = None
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.

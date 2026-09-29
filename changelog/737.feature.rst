@@ -1,0 +1,5 @@
+Add optional hook recursion protection via :meth:`PluginManager.enable_recursion_guard <pluggy.PluginManager.enable_recursion_guard>`.
+When enabled, pluggy tracks the active hook call chain per execution context (recording hook name, implementing plugins and depth), limits the total nesting depth of a call chain, and can forbid selected hooks from direct or indirect re-entry.
+Violations raise :class:`pluggy.HookRecursionError` carrying the trimmed call chain.
+The guard is disabled by default and tracks chains per thread/async task, so independent call chains are never mistaken for recursion.
+
