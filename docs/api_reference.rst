@@ -48,6 +48,15 @@ API Reference
     :show-inheritance:
     :members:
 
+.. autoclass:: pluggy.CallProfiler()
+    :members:
+
+.. autoclass:: pluggy.HookCallProfile()
+    :members:
+
+.. autoclass:: pluggy.ImplTiming()
+    :members:
+
 
 Warnings
 --------

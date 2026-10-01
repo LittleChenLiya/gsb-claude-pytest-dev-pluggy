@@ -1015,6 +1015,48 @@ The expected signature and default implementations for these functions is:
     def after(outcome, hook_name, hook_impls, kwargs):
         pass
 
+.. _profiling:
+
+Call profiling
+--------------
+To find out which plugin (or which wrapper layer) spends how much time
+during a hook call, use the optional call profiler:
+
+.. code-block:: python
+
+    from pluggy import CallProfiler
+
+    profiler = CallProfiler()  # a fake clock can be injected for testing
+    undo = pm.enable_call_profiling(profiler)
+
+    pm.hook.myhook(arg=1)
+
+    for profile in profiler.calls:
+        print(profile.hook_name, profile.duration, profile.status)
+        for timing in profile.impl_timings:
+            print(" ", timing.plugin_name, timing.own_duration, timing.status)
+
+For every hook call a :py:class:`~pluggy.HookCallProfile` is recorded,
+holding one :py:class:`~pluggy.ImplTiming` per hook implementation that
+was actually executed - implementations skipped because of
+:ref:`firstresult` or an exception are not recorded at all. Wrapper
+implementations report their own execution time
+(:py:attr:`~pluggy.ImplTiming.own_duration`) separately from the time
+spent in the calls they wrap
+(:py:attr:`~pluggy.ImplTiming.inner_duration`). Hook calls made from
+within another hook call are linked through
+:py:attr:`~pluggy.HookCallProfile.parent` and
+:py:attr:`~pluggy.HookCallProfile.children` without mixing their
+timings, and concurrent threads are kept apart. No argument values or
+return values are stored.
+
+Profiling never changes hook behavior: results, exceptions and call order
+are identical whether profiling is enabled or not. If the profiler itself
+fails, monitoring is disabled and hook calls continue unaffected.
+
+A runnable demo which prints plugin names and timings is available at
+``docs/examples/profiling-example.py``.
+
 Public API
 **********
 Please see the :doc:`api_reference`.

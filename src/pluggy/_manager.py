@@ -25,6 +25,8 @@ from ._hooks import HookimplOpts
 from ._hooks import HookRelay
 from ._hooks import HookspecOpts
 from ._hooks import normalize_hookimpl_opts
+from ._profiling import _current_profile
+from ._profiling import CallProfiler
 from ._result import Result
 
 
@@ -569,6 +571,54 @@ class PluginManager:
             return outcome.get_result()
 
         self._inner_hookexec = traced_hookexec
+
+        def undo() -> None:
+            self._inner_hookexec = oldcall
+
+        return undo
+
+    def enable_call_profiling(self, profiler: CallProfiler) -> Callable[[], None]:
+        """Enable per-call profiling of hook executions.
+
+        Returns an undo function which, when called, removes the profiling.
+
+        For every hook call, a :class:`~pluggy.HookCallProfile` is recorded
+        on the given :class:`~pluggy.CallProfiler`, holding the entry,
+        exit, outcome and duration of each hook implementation which was
+        actually executed. Wrappers report their own execution time
+        separately from the time spent in the calls they wrap. Hook calls
+        made from within another hook call (recursion) are linked to the
+        enclosing call's profile, and concurrent threads are kept apart.
+
+        Profiling never changes hook behavior: results, exceptions and call
+        order are identical whether profiling is enabled or not, and a
+        failure of the profiler itself disables monitoring instead of
+        affecting the hook call.
+        """
+        oldcall = self._inner_hookexec
+
+        def profiled_hookexec(
+            hook_name: str,
+            hook_impls: Sequence[HookImpl],
+            caller_kwargs: Mapping[str, object],
+            firstresult: bool,
+        ) -> object | list[object]:
+            profile = profiler._begin_call(hook_name)
+            if profile is None:
+                return oldcall(hook_name, hook_impls, caller_kwargs, firstresult)
+            token = _current_profile.set(profile)
+            try:
+                try:
+                    result = oldcall(hook_name, hook_impls, caller_kwargs, firstresult)
+                except BaseException:
+                    profiler._end_call(profile, ok=False)
+                    raise
+                profiler._end_call(profile, ok=True)
+                return result
+            finally:
+                _current_profile.reset(token)
+
+        self._inner_hookexec = profiled_hookexec
 
         def undo() -> None:
             self._inner_hookexec = oldcall

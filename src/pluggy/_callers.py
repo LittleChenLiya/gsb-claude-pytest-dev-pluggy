@@ -14,9 +14,14 @@ from typing import TypeAlias
 import warnings
 
 from ._hooks import HookImpl
+from ._profiling import _current_profile
 from ._result import HookCallError
 from ._result import Result
 from ._warnings import PluggyTeardownRaisedWarning
+
+
+if TYPE_CHECKING:
+    from ._profiling import _Pending
 
 
 # Need to distinguish between old- and new-style hook wrappers.
@@ -94,6 +99,11 @@ def _multicall(
     results: list[object] = []
     exception = None
     teardowns: list[Teardown] = []
+    # The profile of this hook call when call profiling is enabled, else
+    # None. See pluggy._profiling and PluginManager.enable_call_profiling.
+    profile = _current_profile.get()
+    # In-flight profiling state for each teardown, parallel to teardowns.
+    pendings: list[_Pending | None] = []
     try:  # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
@@ -104,26 +114,60 @@ def _multicall(
                 ) from e
 
             if hook_impl.hookwrapper:
-                function_gen = run_old_style_hookwrapper(hook_impl, hook_name, args)
-
-                next(function_gen)  # first yield
+                pending = (
+                    profile.impl_enter(hook_impl, is_wrapper=True)
+                    if profile is not None
+                    else None
+                )
+                try:
+                    function_gen = run_old_style_hookwrapper(hook_impl, hook_name, args)
+                    next(function_gen)  # first yield
+                except BaseException:
+                    if profile is not None:
+                        profile.impl_exit(pending, ok=False)
+                    raise
+                if profile is not None:
+                    profile.wrapper_setup_done(pending)
                 teardowns.append(function_gen)
+                pendings.append(pending)
 
             elif hook_impl.wrapper:
-                res = hook_impl.function(*args)
-                # If this cast is not valid, a type error is raised below,
-                # which is the desired response.
-                if TYPE_CHECKING:
-                    function_gen = cast(Generator[None, object, object], res)
-                else:
-                    function_gen = res
+                pending = (
+                    profile.impl_enter(hook_impl, is_wrapper=True)
+                    if profile is not None
+                    else None
+                )
                 try:
-                    next(function_gen)  # first yield
-                except StopIteration:
-                    _raise_wrapfail(function_gen, "did not yield")
+                    res = hook_impl.function(*args)
+                    # If this cast is not valid, a type error is raised below,
+                    # which is the desired response.
+                    if TYPE_CHECKING:
+                        function_gen = cast(Generator[None, object, object], res)
+                    else:
+                        function_gen = res
+                    try:
+                        next(function_gen)  # first yield
+                    except StopIteration:
+                        _raise_wrapfail(function_gen, "did not yield")
+                except BaseException:
+                    if profile is not None:
+                        profile.impl_exit(pending, ok=False)
+                    raise
+                if profile is not None:
+                    profile.wrapper_setup_done(pending)
                 teardowns.append(function_gen)
+                pendings.append(pending)
             else:
-                res = hook_impl.function(*args)
+                if profile is not None:
+                    pending = profile.impl_enter(hook_impl, is_wrapper=False)
+                    try:
+                        res = hook_impl.function(*args)
+                    except BaseException:
+                        profile.impl_exit(pending, ok=False)
+                        raise
+                    profile.impl_exit(pending, ok=True)
+                else:
+                    res = hook_impl.function(*args)
                 if res is not None:
                     results.append(res)
                     if firstresult:  # halt further impl calls
@@ -137,7 +181,11 @@ def _multicall(
             result = results
 
         # run all wrapper post-yield blocks
-        for teardown in reversed(teardowns):
+        for i in range(len(teardowns) - 1, -1, -1):
+            teardown = teardowns[i]
+            pending = pendings[i]
+            if profile is not None:
+                profile.wrapper_teardown_enter(pending)
             try:
                 if exception is not None:
                     try:
@@ -150,6 +198,8 @@ def _multicall(
                             and re.__cause__ is exception
                         ):
                             teardown.close()
+                            if profile is not None:
+                                profile.wrapper_teardown_exit(pending, ok=False)
                             continue
                         else:
                             raise
@@ -162,10 +212,16 @@ def _multicall(
             except StopIteration as si:
                 result = si.value
                 exception = None
+                if profile is not None:
+                    profile.wrapper_teardown_exit(pending, ok=True)
                 continue
             except BaseException as e:
                 exception = e
+                if profile is not None:
+                    profile.wrapper_teardown_exit(pending, ok=False)
                 continue
+            if profile is not None:
+                profile.wrapper_teardown_exit(pending, ok=False)
             _raise_wrapfail(teardown, "has second yield")
 
     if exception is not None:

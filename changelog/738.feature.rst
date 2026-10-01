@@ -1,0 +1,8 @@
+Added an optional hook call profiler: :py:class:`pluggy.CallProfiler`
+enabled via :py:meth:`pluggy.PluginManager.enable_call_profiling`
+records a :py:class:`pluggy.HookCallProfile` for every hook call, with
+the entry, exit, outcome and duration of each hook implementation that
+actually ran. Wrappers report their own execution time separately from
+the time spent in the calls they wrap, recursive calls are linked to
+their parent call, the clock is injectable for testing, and a profiler
+failure disables monitoring without affecting hook behavior.

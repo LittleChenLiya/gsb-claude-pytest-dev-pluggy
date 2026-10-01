@@ -1,5 +1,7 @@
 __all__ = [
+    "CallProfiler",
     "HookCallError",
+    "HookCallProfile",
     "HookCaller",
     "HookImpl",
     "HookRelay",
@@ -7,6 +9,7 @@ __all__ = [
     "HookimplOpts",
     "HookspecMarker",
     "HookspecOpts",
+    "ImplTiming",
     "PluggyTeardownRaisedWarning",
     "PluggyWarning",
     "PluginManager",
@@ -23,6 +26,9 @@ from ._hooks import HookspecMarker
 from ._hooks import HookspecOpts
 from ._manager import PluginManager
 from ._manager import PluginValidationError
+from ._profiling import CallProfiler
+from ._profiling import HookCallProfile
+from ._profiling import ImplTiming
 from ._result import HookCallError
 from ._result import Result
 from ._warnings import PluggyTeardownRaisedWarning
