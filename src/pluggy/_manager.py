@@ -183,12 +183,25 @@ class PluginManager:
         # enable_tracing will set its own wrapping function at self._inner_hookexec
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
 
-    def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
+    def register(
+        self,
+        plugin: _Plugin,
+        name: str | None = None,
+        strict_history: bool = False,
+    ) -> str | None:
         """Register a plugin and return its name.
 
         :param name:
             The name under which to register the plugin. If not specified, a
             name is generated using :func:`get_canonical_name`.
+
+        :param strict_history:
+            If ``True`` and the plugin implements a :ref:`historic <historic>`
+            hook whose history has gaps (records were trimmed by its history
+            window), registration is rejected with
+            :class:`PluginValidationError` *before* the plugin is called. By
+            default (``False``) the plugin is registered and replays only the
+            records still retained by the window.
 
         :returns:
             The plugin name. If the name is blocked from registering, returns
@@ -216,7 +229,11 @@ class PluginManager:
         # changed at point of return
         self._name2plugin[plugin_name] = plugin
 
-        # register matching hook implementations of the plugin
+        # Discover and verify hook implementations up front. This lets strict
+        # history validation reject before any history is replayed (and thus
+        # before any plugin code runs), instead of calling the plugin first
+        # and only then discovering that records are missing.
+        to_add: list[tuple[HookCaller, HookImpl]] = []
         for attr_name in dir(plugin):
             hookimpl_opts = self.parse_hookimpl_opts(plugin, attr_name)
             if hookimpl_opts is not None:
@@ -236,8 +253,25 @@ class PluginManager:
                     setattr(self.hook, hook_name, hook)
                 elif hook.has_spec():
                     self._verify_hook(hook, hookimpl)
-                    hook._maybe_apply_history(hookimpl)
-                hook._add_hookimpl(hookimpl)
+                to_add.append((hook, hookimpl))
+
+        if strict_history:
+            for hook, hookimpl in to_add:
+                history = hook._history
+                if hook.is_historic() and history is not None and history.has_gap():
+                    assert history.trimmed is not None
+                    lo, hi = history.trimmed
+                    raise PluginValidationError(
+                        plugin,
+                        f"Plugin {plugin_name!r} requires the complete history "
+                        f"of hook {hook.name!r}, but record(s) {lo}-{hi} were "
+                        f"trimmed by its history window of size {history.size}; "
+                        "complete history is not available",
+                    )
+
+        for hook, hookimpl in to_add:
+            hook._maybe_apply_history(hookimpl)
+            hook._add_hookimpl(hookimpl)
         return plugin_name
 
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:

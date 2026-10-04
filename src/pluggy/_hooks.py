@@ -4,6 +4,7 @@ Internal hook annotation, representation and calling machinery.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from collections.abc import Generator
 from collections.abc import Mapping
@@ -52,6 +53,9 @@ class HookspecOpts(TypedDict):
     #:
     #: .. versionadded:: 1.5
     warn_on_impl_args: Mapping[str, Warning] | None
+    #: Maximum number of historic calls to retain. ``None`` (the default)
+    #: retains every call. Only meaningful when ``historic`` is true.
+    history_size: int | None
 
 
 class HookimplOpts(TypedDict):
@@ -97,6 +101,7 @@ class HookspecMarker:
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
+        history_size: int | None = None,
     ) -> _F: ...
 
     @overload
@@ -107,6 +112,7 @@ class HookspecMarker:
         historic: bool = ...,
         warn_on_impl: Warning | None = ...,
         warn_on_impl_args: Mapping[str, Warning] | None = ...,
+        history_size: int | None = ...,
     ) -> Callable[[_F], _F]: ...
 
     def __call__(
@@ -116,6 +122,7 @@ class HookspecMarker:
         historic: bool = False,
         warn_on_impl: Warning | None = None,
         warn_on_impl_args: Mapping[str, Warning] | None = None,
+        history_size: int | None = None,
     ) -> _F | Callable[[_F], _F]:
         """If passed a function, directly sets attributes on the function
         which will make it discoverable to :meth:`PluginManager.add_hookspecs`.
@@ -142,16 +149,33 @@ class HookspecMarker:
             See :ref:`warn_on_impl`.
 
             .. versionadded:: 1.5
+
+        :param history_size:
+            If given a positive integer, the :ref:`historic <historic>` hook
+            retains at most that many calls, keeping the most recent ones and
+            trimming older records (whose sequence range is reported). If
+            ``None`` (the default), every call is retained. Only meaningful
+            when ``historic`` is true.
         """
 
         def setattr_hookspec_opts(func: _F) -> _F:
             if historic and firstresult:
                 raise ValueError("cannot have a historic firstresult hook")
+            if history_size is not None and (
+                isinstance(history_size, bool)
+                or not isinstance(history_size, int)
+                or history_size < 1
+            ):
+                raise ValueError(
+                    "history_size must be a positive integer or None, "
+                    f"not {history_size!r}"
+                )
             opts: HookspecOpts = {
                 "firstresult": firstresult,
                 "historic": historic,
                 "warn_on_impl": warn_on_impl,
                 "warn_on_impl_args": warn_on_impl_args,
+                "history_size": history_size,
             }
             setattr(func, self.project_name + "_spec", opts)
             return func
@@ -402,16 +426,72 @@ class HookRelay:
 _HookRelay = HookRelay
 
 
-_CallHistory: TypeAlias = list[
-    tuple[Mapping[str, object], Callable[[Any], None] | None]
+_HistoryRecord: TypeAlias = tuple[
+    int, Mapping[str, object], Callable[[Any], None] | None
 ]
+
+
+class _History:
+    """A record of historic hook calls, optionally bounded to a window.
+
+    Each call is recorded as a ``(sequence, kwargs, result_callback)`` tuple.
+    When ``size`` is not ``None``, only the most recent ``size`` records are
+    retained; older records are trimmed and can no longer be replayed to
+    plugins registered afterwards. The cumulative sequence range of trimmed
+    records is kept in :attr:`trimmed`.
+    """
+
+    __slots__ = ("records", "seq", "size", "trimmed")
+
+    def __init__(self, size: int | None) -> None:
+        #: The retained records, oldest first.
+        self.records: deque[_HistoryRecord] = deque()
+        #: The window size, or ``None`` for an unbounded history.
+        self.size: Final[int | None] = size
+        #: The sequence number to assign to the next record.
+        self.seq: int = 1
+        #: The cumulative ``(from_seq, to_seq)`` range of trimmed records,
+        #: or ``None`` if nothing has been trimmed.
+        self.trimmed: tuple[int, int] | None = None
+
+    def append(
+        self,
+        kwargs: Mapping[str, object],
+        result_callback: Callable[[Any], None] | None,
+    ) -> int | None:
+        """Record a call and return the sequence number trimmed, if any."""
+        record: _HistoryRecord = (self.seq, kwargs, result_callback)
+        self.seq += 1
+        self.records.append(record)
+        if self.size is not None and len(self.records) > self.size:
+            trimmed = self.records.popleft()
+            trimmed_seq = trimmed[0]
+            if self.trimmed is None:
+                self.trimmed = (trimmed_seq, trimmed_seq)
+            else:
+                self.trimmed = (
+                    min(self.trimmed[0], trimmed_seq),
+                    max(self.trimmed[1], trimmed_seq),
+                )
+            return trimmed_seq
+        return None
+
+    def has_gap(self) -> bool:
+        """Whether records have been trimmed, leaving a gap from sequence 1."""
+        return self.trimmed is not None
+
+    def reset(self) -> None:
+        """Clear all records and restart sequence/gap tracking."""
+        self.records.clear()
+        self.seq = 1
+        self.trimmed = None
 
 
 class HookCaller:
     """A caller of all registered implementations of a hook specification."""
 
     __slots__ = (
-        "_call_history",
+        "_history",
         "_hookexec",
         "_hookimpls",
         "name",
@@ -437,7 +517,7 @@ class HookCaller:
         # 5. wrappers
         # 6. tryfirst wrappers
         self._hookimpls: Final[list[HookImpl]] = []
-        self._call_history: _CallHistory | None = None
+        self._history: _History | None = None
         # TODO: Document, or make private.
         self.spec: HookSpec | None = None
         if specmodule_or_class is not None:
@@ -461,11 +541,49 @@ class HookCaller:
             )
         self.spec = HookSpec(specmodule_or_class, self.name, spec_opts)
         if spec_opts.get("historic"):
-            self._call_history = []
+            self._history = _History(spec_opts.get("history_size"))
 
     def is_historic(self) -> bool:
         """Whether this caller is :ref:`historic <historic>`."""
-        return self._call_history is not None
+        return self._history is not None
+
+    @property
+    def history_size(self) -> int | None:
+        """The history window size, or ``None`` for an unbounded history."""
+        return self._history.size if self._history is not None else None
+
+    @property
+    def history_trimmed(self) -> tuple[int, int] | None:
+        """The cumulative ``(from_seq, to_seq)`` range of records trimmed by
+        the history window, or ``None`` if nothing has been trimmed.
+
+        A non-``None`` value means the retained history has a gap from sequence
+        1, so strict history registration will reject and plugins registered
+        afterwards only replay the retained records.
+        """
+        return self._history.trimmed if self._history is not None else None
+
+    @property
+    def _call_history(self) -> _History | None:
+        """Backward-compatible access to the call history.
+
+        Historically this was a plain list of records; it is now a
+        :class:`_History` object. The setter accepts ``None``, a
+        :class:`_History`, or any other value (notably an empty list, as used
+        by pytest to reset a historic hook), which clears the retained
+        records and restarts sequence/gap tracking.
+        """
+        return self._history
+
+    @_call_history.setter
+    def _call_history(self, value: object) -> None:
+        if value is None:
+            self._history = None
+        elif isinstance(value, _History):
+            self._history = value
+        elif self._history is not None:
+            # Legacy reset (e.g. pytest sets ``hook._call_history = []``).
+            self._history.reset()
 
     def _remove_plugin(self, plugin: _Plugin) -> None:
         """Remove all hook implementations registered by the given plugin."""
@@ -548,6 +666,7 @@ class HookCaller:
         self,
         result_callback: Callable[[Any], None] | None = None,
         kwargs: Mapping[str, object] | None = None,
+        snapshot: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
     ) -> None:
         """Call the hook with given ``kwargs`` for all registered plugins and
         for all plugins which will be registered afterwards, see
@@ -556,11 +675,22 @@ class HookCaller:
         :param result_callback:
             If provided, will be called for each non-``None`` result obtained
             from a hook implementation.
+
+        :param kwargs:
+            The keyword arguments to pass to the hook implementations.
+
+        :param snapshot:
+            If provided, a callable used to snapshot ``kwargs`` before it is
+            recorded. The snapshot is stored in the history instead of
+            ``kwargs`` itself, so later mutations of the caller's argument
+            mapping do not affect replayed calls. A plain ``dict`` works for
+            shallow copies; use a deep copy for nested arguments.
         """
-        assert self._call_history is not None
+        assert self._history is not None
         kwargs = kwargs or {}
         self._verify_all_args_are_provided(kwargs)
-        self._call_history.append((kwargs, result_callback))
+        recorded_kwargs = snapshot(kwargs) if snapshot is not None else kwargs
+        self._history.append(recorded_kwargs, result_callback)
         # Historizing hooks don't return results.
         # Remember firstresult isn't compatible with historic.
         # Copy because plugins may register other plugins during iteration (#438).
@@ -608,8 +738,8 @@ class HookCaller:
     def _maybe_apply_history(self, method: HookImpl) -> None:
         """Apply call history to a new hookimpl if it is marked as historic."""
         if self.is_historic():
-            assert self._call_history is not None
-            for kwargs, result_callback in self._call_history:
+            assert self._history is not None
+            for _seq, kwargs, result_callback in self._history.records:
                 res = self._hookexec(self.name, [method], kwargs, False)
                 if res and result_callback is not None:
                     # XXX: remember firstresult isn't compat with historic
@@ -659,8 +789,18 @@ class _SubsetHookCaller(HookCaller):
         return self._orig.spec
 
     @property
-    def _call_history(self) -> _CallHistory | None:  # type: ignore[override]
+    def _history(self) -> _History | None:  # type: ignore[override]
+        return self._orig._history
+
+    @property
+    def _call_history(self) -> _History | None:
         return self._orig._call_history
+
+    @_call_history.setter
+    def _call_history(self, value: object) -> None:
+        # Delegate legacy resets (e.g. ``hook._call_history = []``) to the
+        # original hook caller.
+        self._orig._call_history = value
 
     def __repr__(self) -> str:
         return f"<_SubsetHookCaller {self.name!r}>"

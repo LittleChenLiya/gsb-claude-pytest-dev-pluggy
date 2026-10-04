@@ -651,6 +651,70 @@ dynamically loaded plugins.
 
 For more info see :ref:`call_historic`.
 
+.. _historic_window:
+
+History window
+""""""""""""""
+
+By default a historic hook retains **every** call ever made, replaying the
+whole sequence to each newly registered plugin. For long-running programs this
+unbounded history can grow without limit. You can bound it with the
+``history_size`` option, which keeps only the most recent N calls (the
+*window*):
+
+.. code-block:: python
+
+    @hookspec(historic=True, history_size=2)
+    def myhook(config, args):
+        pass
+
+Calls are numbered by sequence. When the (N+1)-th call arrives, the oldest
+record is *trimmed*: it is dropped from the history and can no longer be
+replayed. The cumulative sequence range of trimmed records is reported through
+the :py:attr:`~pluggy.HookCaller.history_trimmed` attribute (``None`` until
+something is trimmed). Trimming never re-invokes the ``result_callback`` of a
+trimmed call.
+
+Plugins registered afterwards replay only the records still retained by the
+window. If a plugin requires the **complete** history, register it with
+``strict_history=True``: registration is rejected with
+:class:`~pluggy.PluginValidationError` *before* the plugin is called when the
+history has a gap (records were trimmed):
+
+.. code-block:: python
+
+    # Rejected if records were trimmed; the plugin is not called.
+    pm.register(plugin, strict_history=True)
+
+Use ``strict_history=True`` when a plugin cannot meaningfully run without
+seeing every past call. Use the default (``strict_history=False``) for plugins
+that only need the recent state.
+
+.. note::
+
+    The window is opt-in. ``@hookspec(historic=True)`` without
+    ``history_size`` retains every call, exactly as before.
+
+Snapshotting arguments
+""""""""""""""""""""""
+
+A historic call records its keyword arguments for later replay. By default the
+record keeps a reference to the caller's argument mapping, so later mutations
+of that mapping are visible on replay. To freeze the arguments, pass a
+``snapshot`` callable to :py:meth:`~pluggy.HookCaller.call_historic()`; it is
+applied to the mapping before recording and the result is stored instead:
+
+.. code-block:: python
+
+    pm.hook.myhook.call_historic(
+        kwargs={"config": config, "args": args},
+        result_callback=callback,
+        snapshot=dict,  # shallow copy; use copy.deepcopy for nested data
+    )
+
+The snapshot is the caller's responsibility: pass ``dict`` for a shallow copy
+or a deep-copy function for nested arguments.
+
 
 .. _warn_on_impl:
 
@@ -954,6 +1018,12 @@ is registered.
     *historic* calls are incompatible with :ref:`firstresult` marked
     hooks since only the first registered plugin's hook(s) would
     ever be called.
+
+.. note::
+    The recorded ``kwargs`` mapping is referenced by default, so later
+    mutations are visible on replay. Pass a ``snapshot`` callable (such as
+    ``dict``) to :py:meth:`~pluggy.HookCaller.call_historic()` to freeze the
+    arguments. See :ref:`historic_window`.
 
 .. _call_extra:
 

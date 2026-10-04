@@ -475,6 +475,345 @@ def test_register_historic(pm: PluginManager) -> None:
     assert out == [1, 10, 120, 12]
 
 
+# --- historic history window tests -----------------------------------------
+
+
+def test_historic_history_window_replays_retained(pm: PluginManager) -> None:
+    """With a history window, a late plugin only replays retained records."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    for i in (1, 2, 3):
+        pm.hook.he_method1.call_historic(kwargs={"arg": i})
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    # Capacity 2: only records 2 and 3 are replayed, in sequence.
+    assert out == [2, 3]
+
+
+def test_historic_history_window_strict_registration_rejects_gap(
+    pm: PluginManager,
+) -> None:
+    """Strict registration rejects before calling the plugin when records were
+    trimmed."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    for i in (1, 2, 3):
+        pm.hook.he_method1.call_historic(kwargs={"arg": i})
+
+    calls = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            calls.append(arg)
+
+    with pytest.raises(PluginValidationError, match=r"record\(s\) 1-1"):
+        pm.register(Plugin(), strict_history=True)
+    # The plugin must not have been called at all.
+    assert calls == []
+
+
+def test_historic_history_window_strict_registration_allows_no_gap(
+    pm: PluginManager,
+) -> None:
+    """Strict registration succeeds when nothing was trimmed."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+    pm.hook.he_method1.call_historic(kwargs={"arg": 2})
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin(), strict_history=True)
+    assert out == [1, 2]
+
+
+def test_historic_history_window_snapshot_kwargs(pm: PluginManager) -> None:
+    """A caller-provided snapshot freezes the recorded kwargs."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    kwargs = {"arg": 1}
+    pm.hook.he_method1.call_historic(kwargs=kwargs, snapshot=dict)
+    kwargs["arg"] = 999
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    # The replay uses the snapshot, not the later-mutated dict.
+    assert out == [1]
+
+
+def test_historic_history_window_without_snapshot_keeps_reference(
+    pm: PluginManager,
+) -> None:
+    """Without a snapshot the recorded kwargs dict is referenced as before."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    kwargs = {"arg": 1}
+    pm.hook.he_method1.call_historic(kwargs=kwargs)
+    kwargs["arg"] = 999
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == [999]
+
+
+def test_historic_history_window_trim_does_not_reinvoke_callback(
+    pm: PluginManager,
+) -> None:
+    """Trimming records does not re-invoke their result_callback."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    results = []
+
+    def callback(res) -> None:
+        results.append(res)
+
+    for i in (1, 2, 3):
+        pm.hook.he_method1.call_historic(result_callback=callback, kwargs={"arg": i})
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            return arg * 10
+
+    pm.register(Plugin())
+    # Only retained records (2, 3) are replayed; record 1's callback is not
+    # invoked by the trim.
+    assert results == [20, 30]
+
+
+def test_historic_history_window_nested_registration(pm: PluginManager) -> None:
+    """A plugin registered during history replay still gets the retained window."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    for i in (1, 2, 3):
+        pm.hook.he_method1.call_historic(kwargs={"arg": i})
+
+    out = []
+
+    class Nested:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(("nested", arg))
+
+    class Plugin:
+        def __init__(self) -> None:
+            self.registered = False
+
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(("plugin", arg))
+            if not self.registered:
+                pm.register(Nested())
+                self.registered = True
+
+    pm.register(Plugin())
+    # Both the plugin and the nested plugin receive only the retained window.
+    assert out == [
+        ("plugin", 2),
+        ("nested", 2),
+        ("nested", 3),
+        ("plugin", 3),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("size", "calls", "expected"),
+    [
+        (1, 3, [3]),  # only the most recent record
+        (2, 3, [2, 3]),  # window of 2
+        (3, 3, [1, 2, 3]),  # exact window, no gap
+        (3, 4, [2, 3, 4]),  # one record trimmed
+        (2, 2, [1, 2]),  # boundary: exactly capacity
+    ],
+)
+def test_historic_history_window_boundary(
+    pm: PluginManager, size: int, calls: int, expected: list[int]
+) -> None:
+    """Boundary conditions for the history window size."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=size)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    for i in range(1, calls + 1):
+        pm.hook.he_method1.call_historic(kwargs={"arg": i})
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == expected
+
+
+def test_historic_history_window_reports_trimmed_range(
+    pm: PluginManager,
+) -> None:
+    """Trimming reports the trimmed sequence range via ``history_trimmed``."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+
+    def get_trimmed() -> tuple[int, int] | None:
+        return hook.history_trimmed
+
+    assert hook.history_size == 2
+    assert get_trimmed() is None
+    hook.call_historic(kwargs={"arg": 1})
+    hook.call_historic(kwargs={"arg": 2})
+    hook.call_historic(kwargs={"arg": 3})
+    assert get_trimmed() == (1, 1)
+    hook.call_historic(kwargs={"arg": 4})
+    assert get_trimmed() == (1, 2)
+
+
+def test_historic_history_window_with_subset_caller(pm: PluginManager) -> None:
+    """The history window works through a subset hook caller."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Blocker:
+        @hookimpl
+        def he_method1(self, arg):
+            pass
+
+    blocker = Blocker()
+    pm.register(blocker)
+
+    shc = pm.subset_hook_caller("he_method1", remove_plugins=[blocker])
+    for i in (1, 2, 3):
+        shc.call_historic(kwargs={"arg": i})
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    assert out == [2, 3]
+
+
+def test_historic_history_backward_compat_reset(pm: PluginManager) -> None:
+    """Setting ``hook._call_history = []`` (as pytest does to reset a historic
+    hook) clears the retained records and restarts sequence/gap tracking."""
+
+    class Hooks:
+        @hookspec(historic=True, history_size=2)
+        def he_method1(self, arg): ...
+
+    pm.add_hookspecs(Hooks)
+    hook = pm.hook.he_method1
+
+    def get_trimmed() -> tuple[int, int] | None:
+        return hook.history_trimmed
+
+    for i in (1, 2, 3):
+        hook.call_historic(kwargs={"arg": i})
+    assert get_trimmed() == (1, 1)
+
+    # Legacy reset, as performed by pytest's own unconfigure.
+    hook._call_history = []
+    assert get_trimmed() is None
+    assert hook.history_size == 2
+
+    out = []
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg):
+            out.append(arg)
+
+    pm.register(Plugin())
+    # After the reset, no records are replayed.
+    assert out == []
+    # ...and a fresh call starts a new sequence.
+    hook.call_historic(kwargs={"arg": 9})
+    assert hook.history_trimmed is None
+
+
+def test_historic_history_size_validation() -> None:
+    """``history_size`` must be a positive integer or ``None``."""
+
+    def dummy() -> None: ...
+
+    bad_values: tuple[Any, ...] = (0, -1, "2", 2.0, True)
+    for bad in bad_values:
+        decorator = hookspec(historic=True, history_size=bad)
+        with pytest.raises(ValueError, match="history_size"):
+            decorator(dummy)
+    # Valid values are accepted.
+    hookspec(historic=True, history_size=1)(dummy)
+    hookspec(historic=True, history_size=None)(dummy)
+    hookspec(historic=True)(dummy)
+
+
 def test_historic_with_subset_hook_caller(pm: PluginManager) -> None:
     class Hooks:
         @hookspec(historic=True)

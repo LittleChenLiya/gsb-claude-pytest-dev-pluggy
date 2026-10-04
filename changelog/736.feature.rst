@@ -1,0 +1,9 @@
+Historic hooks can now be given a finite history window with
+``@hookspec(historic=True, history_size=N)``. Only the most recent N calls are
+retained and replayed to plugins registered afterwards; the cumulative sequence
+range of trimmed records is reported through ``HookCaller.history_trimmed``.
+Plugins that require the complete history can be registered with
+``pm.register(plugin, strict_history=True)``, which rejects before calling the
+plugin when records have been trimmed. ``call_historic`` also gained a
+``snapshot`` parameter to freeze the recorded keyword arguments. The default
+``historic=True`` behavior (unbounded history) is unchanged.
