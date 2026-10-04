@@ -412,6 +412,8 @@ class HookCaller:
 
     __slots__ = (
         "_call_history",
+        "_history_dropped",
+        "_history_limit",
         "_hookexec",
         "_hookimpls",
         "name",
@@ -438,6 +440,13 @@ class HookCaller:
         # 6. tryfirst wrappers
         self._hookimpls: Final[list[HookImpl]] = []
         self._call_history: _CallHistory | None = None
+        # Maximum amount of historic call records to retain, or None for
+        # an unbounded history (the default, historic behavior).
+        self._history_limit: int | None = None
+        # Amount of historic call records dropped by the history limit.
+        # Records are numbered 1-based in call order, so the dropped
+        # records are exactly the sequence range 1.._history_dropped.
+        self._history_dropped: int = 0
         # TODO: Document, or make private.
         self.spec: HookSpec | None = None
         if specmodule_or_class is not None:
@@ -466,6 +475,61 @@ class HookCaller:
     def is_historic(self) -> bool:
         """Whether this caller is :ref:`historic <historic>`."""
         return self._call_history is not None
+
+    def set_history_limit(self, limit: int | None) -> None:
+        """Bound the historic call history to the most recent ``limit``
+        calls, see :ref:`historic_window`.
+
+        Records beyond the limit are dropped, oldest first. Dropping a
+        record never re-invokes its ``result_callback``. Plugins registered
+        afterwards only replay the retained window, unless they are
+        registered with ``require_complete_history=True`` (see
+        :meth:`PluginManager.register`), which refuses registration when
+        records were dropped.
+
+        :param limit:
+            The maximum amount of historic call records to retain, or
+            ``None`` to restore the default unbounded history. Records
+            already dropped are not recovered.
+        """
+        if not self.is_historic():
+            raise ValueError(
+                f"Cannot set a history limit on non-historic hook {self.name!r}"
+            )
+        if limit is not None and limit < 0:
+            raise ValueError(f"history limit must be non-negative, got {limit}")
+        self._history_limit = limit
+        self._trim_history()
+
+    @property
+    def history_limit(self) -> int | None:
+        """The historic call history limit, or ``None`` if unbounded."""
+        return self._history_limit
+
+    def has_complete_history(self) -> bool:
+        """Whether no historic call record was ever dropped by a
+        :meth:`history limit <set_history_limit>`."""
+        return self._history_dropped == 0
+
+    @property
+    def history_dropped_range(self) -> tuple[int, int] | None:
+        """The 1-based sequence range ``(first, last)`` of historic call
+        records dropped by the history limit, or ``None`` if no record was
+        dropped."""
+        if self._history_dropped == 0:
+            return None
+        return (1, self._history_dropped)
+
+    def _trim_history(self) -> None:
+        """Drop records beyond the history limit, oldest first.
+
+        Only removes records; never replays their ``result_callback``."""
+        if self._call_history is None or self._history_limit is None:
+            return
+        excess = len(self._call_history) - self._history_limit
+        if excess > 0:
+            del self._call_history[:excess]
+            self._history_dropped += excess
 
     def _remove_plugin(self, plugin: _Plugin) -> None:
         """Remove all hook implementations registered by the given plugin."""
@@ -548,6 +612,7 @@ class HookCaller:
         self,
         result_callback: Callable[[Any], None] | None = None,
         kwargs: Mapping[str, object] | None = None,
+        snapshot: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
     ) -> None:
         """Call the hook with given ``kwargs`` for all registered plugins and
         for all plugins which will be registered afterwards, see
@@ -556,11 +621,23 @@ class HookCaller:
         :param result_callback:
             If provided, will be called for each non-``None`` result obtained
             from a hook implementation.
+
+        :param snapshot:
+            If provided, called with ``kwargs`` to produce the mapping stored
+            in the call history and later replayed to newly registered
+            plugins. Use it (for example ``dict`` or ``copy.deepcopy``) when
+            the caller mutates the ``kwargs`` mapping after the call, so the
+            recorded arguments are not affected by the mutation. If not
+            provided, the ``kwargs`` mapping itself is stored, which is the
+            historic default behavior.
         """
         assert self._call_history is not None
         kwargs = kwargs or {}
         self._verify_all_args_are_provided(kwargs)
-        self._call_history.append((kwargs, result_callback))
+        recorded_kwargs = snapshot(kwargs) if snapshot is not None else kwargs
+        self._call_history.append((recorded_kwargs, result_callback))
+        # Trimming only drops records; it never replays result callbacks.
+        self._trim_history()
         # Historizing hooks don't return results.
         # Remember firstresult isn't compatible with historic.
         # Copy because plugins may register other plugins during iteration (#438).
@@ -661,6 +738,22 @@ class _SubsetHookCaller(HookCaller):
     @property
     def _call_history(self) -> _CallHistory | None:  # type: ignore[override]
         return self._orig._call_history
+
+    @property
+    def _history_limit(self) -> int | None:
+        return self._orig._history_limit
+
+    @_history_limit.setter
+    def _history_limit(self, value: int | None) -> None:
+        self._orig._history_limit = value
+
+    @property
+    def _history_dropped(self) -> int:
+        return self._orig._history_dropped
+
+    @_history_dropped.setter
+    def _history_dropped(self, value: int) -> None:
+        self._orig._history_dropped = value
 
     def __repr__(self) -> str:
         return f"<_SubsetHookCaller {self.name!r}>"

@@ -183,12 +183,27 @@ class PluginManager:
         # enable_tracing will set its own wrapping function at self._inner_hookexec
         return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
 
-    def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
+    def register(
+        self,
+        plugin: _Plugin,
+        name: str | None = None,
+        require_complete_history: bool = False,
+    ) -> str | None:
         """Register a plugin and return its name.
 
         :param name:
             The name under which to register the plugin. If not specified, a
             name is generated using :func:`get_canonical_name`.
+
+        :param require_complete_history:
+            If ``True``, refuse to register the plugin when any
+            :ref:`historic <historic>` hook it implements has lost call
+            records to a :ref:`history limit <historic_window>`. The check
+            happens *before* the plugin is registered or any of its hook
+            implementations are called, and raises
+            :exc:`PluginValidationError` reporting the missing record
+            sequence range. If ``False`` (the default), only the retained
+            history window is replayed to the plugin.
 
         :returns:
             The plugin name. If the name is blocked from registering, returns
@@ -211,6 +226,10 @@ class PluginManager:
                 "Plugin already registered under a different name: "
                 f"{plugin_name}={plugin}\n{self._name2plugin}"
             )
+
+        if require_complete_history:
+            # Refuse up front, before the plugin is registered or called.
+            self._check_complete_history(plugin, plugin_name)
 
         # XXX if an error happens we should make sure no state has been
         # changed at point of return
@@ -239,6 +258,36 @@ class PluginManager:
                     hook._maybe_apply_history(hookimpl)
                 hook._add_hookimpl(hookimpl)
         return plugin_name
+
+    def _check_complete_history(self, plugin: _Plugin, plugin_name: str) -> None:
+        """Raise :exc:`PluginValidationError` if any historic hook
+        implemented by ``plugin`` has dropped call records.
+
+        Called by :meth:`register` before the plugin is registered, so a
+        plugin requiring the complete history is never called with a
+        partial one.
+        """
+        gaps: list[str] = []
+        for attr_name in dir(plugin):
+            hookimpl_opts = self.parse_hookimpl_opts(plugin, attr_name)
+            if hookimpl_opts is None:
+                continue
+            hook_name = hookimpl_opts.get("specname") or attr_name
+            hook: HookCaller | None = getattr(self.hook, hook_name, None)
+            if hook is None or not hook.is_historic():
+                continue
+            dropped = hook.history_dropped_range
+            if dropped is not None:
+                gaps.append(
+                    f"hook {hook_name!r} is missing historic call record(s) "
+                    f"{dropped[0]}..{dropped[1]} (dropped by the history limit)"
+                )
+        if gaps:
+            raise PluginValidationError(
+                plugin,
+                f"Plugin {plugin_name!r} requires the complete historic call "
+                "history, but the following gaps exist:\n" + "\n".join(gaps),
+            )
 
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:
         """Try to obtain a hook implementation from an item with the given name

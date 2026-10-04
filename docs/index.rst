@@ -955,6 +955,62 @@ is registered.
     hooks since only the first registered plugin's hook(s) would
     ever be called.
 
+.. _historic_window:
+
+Bounding the historic call history
+----------------------------------
+By default a *historic* hook memorizes every call forever, which grows
+without bound in long-running programs. You can bound the history to an
+explicit window of the most recent ``N`` calls with
+:py:meth:`~pluggy.HookCaller.set_history_limit()`:
+
+.. code-block:: python
+
+    # only the 2 most recent historic calls are retained
+    pm.hook.myhook.set_history_limit(2)
+
+    pm.hook.myhook.call_historic(kwargs={"config": c1})  # record 1
+    pm.hook.myhook.call_historic(kwargs={"config": c2})  # record 2
+    pm.hook.myhook.call_historic(kwargs={"config": c3})  # record 3, trims record 1
+
+    # reports the 1-based sequence range of trimmed records: (1, 1)
+    assert pm.hook.myhook.history_dropped_range == (1, 1)
+
+    # a late plugin only replays the retained window (records 2 and 3)
+    pm.register(mylateplugin)
+
+Trimming only drops records; it never re-invokes the ``result_callback``
+of a trimmed call. Passing ``None`` to
+:py:meth:`~pluggy.HookCaller.set_history_limit()` restores the default
+unbounded history (already-trimmed records are not recovered).
+
+Two replay strategies are available at registration time:
+
+* **Window replay (default):** :py:meth:`~pluggy.PluginManager.register()`
+  replays only the retained window to the new plugin. Records trimmed by
+  the history limit are silently skipped.
+
+* **Complete history (strict):** registering with
+  ``require_complete_history=True`` makes
+  :py:meth:`~pluggy.PluginManager.register()` check *before* registering
+  or calling the plugin whether any historic hook it implements has
+  trimmed records. If there is a gap, registration is refused with
+  :py:exc:`~pluggy.PluginValidationError` reporting the missing record
+  sequence range, and the plugin is never called.
+
+.. code-block:: python
+
+    # raises PluginValidationError: missing historic call record(s) 1..1
+    pm.register(mystrictplugin, require_complete_history=True)
+
+.. note::
+    The recorded ``kwargs`` mapping is stored by reference unless the
+    caller explicitly passes a ``snapshot`` function to
+    :py:meth:`~pluggy.HookCaller.call_historic()` (for example
+    ``snapshot=dict`` or ``snapshot=copy.deepcopy``). Use a snapshot when
+    the calling code mutates the argument mapping after the call, so the
+    history replay is not affected by the mutation.
+
 .. _call_extra:
 
 Calling with extras
