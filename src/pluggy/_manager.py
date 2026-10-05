@@ -160,6 +160,10 @@ class PluginManager:
         #: The project name.
         self.project_name: Final = project_name
         self._name2plugin: Final[dict[str, _Plugin]] = {}
+        # Maps an alias to the canonical plugin name it stands for. The
+        # table is kept flat (each alias points directly at the final
+        # canonical name) and acyclic by `add_alias`.
+        self._alias2canonical: Final[dict[str, str]] = {}
         self._plugin_distinfo: Final[
             list[tuple[_Plugin, importlib.metadata.Distribution]]
         ] = []
@@ -188,7 +192,9 @@ class PluginManager:
 
         :param name:
             The name under which to register the plugin. If not specified, a
-            name is generated using :func:`get_canonical_name`.
+            name is generated using :func:`get_canonical_name`. If the name
+            is an alias (see :meth:`add_alias`), the plugin is registered
+            under the canonical name the alias resolves to.
 
         :returns:
             The plugin name. If the name is blocked from registering, returns
@@ -197,6 +203,8 @@ class PluginManager:
         If the plugin is already registered, raises a :exc:`ValueError`.
         """
         plugin_name = name or self.get_canonical_name(plugin)
+        # An alias resolves to the single canonical registration name.
+        plugin_name = self.resolve_name(plugin_name)
 
         if plugin_name in self._name2plugin:
             if self._name2plugin.get(plugin_name, -1) is None:
@@ -269,7 +277,10 @@ class PluginManager:
         """Unregister a plugin and all of its hook implementations.
 
         The plugin can be specified either by the plugin object or the plugin
-        name. If both are specified, they must agree.
+        name. If both are specified, they must agree. The name may be an
+        alias (see :meth:`add_alias`); it resolves to the canonical name, so
+        unregistering through any alias removes the same single registration
+        and drops the aliases which pointed at it.
 
         Returns the unregistered plugin, or ``None`` if not found.
         """
@@ -277,6 +288,8 @@ class PluginManager:
             assert plugin is not None, "one of name or plugin needs to be specified"
             name = self.get_name(plugin)
             assert name is not None, "plugin is not registered"
+
+        name = self.resolve_name(name)
 
         if plugin is None:
             plugin = self.get_plugin(name)
@@ -292,23 +305,135 @@ class PluginManager:
         if self._name2plugin.get(name):
             assert name is not None
             del self._name2plugin[name]
+            # Drop the aliases which pointed at the unregistered canonical
+            # name, so the name can be reused without stale indirections.
+            for alias, target in list(self._alias2canonical.items()):
+                if target == name:
+                    del self._alias2canonical[alias]
 
         return plugin
 
+    def add_alias(self, alias: str, canonical: str) -> None:
+        """Register ``alias`` as an alternate name for the canonical plugin
+        name ``canonical``.
+
+        Aliases only affect name lookups: :meth:`get_plugin`,
+        :meth:`has_plugin`, :meth:`is_blocked`, :meth:`set_blocked`,
+        :meth:`unblock`, :meth:`unregister` and the ``name`` argument of
+        :meth:`register` all resolve an alias to its canonical name. The
+        registered identity of a plugin remains the single canonical name
+        (see :meth:`get_name`), so adding an alias never re-registers a
+        plugin or re-applies historic hook calls.
+
+        ``canonical`` may itself be an alias; alias chains are normalized so
+        that ``alias`` points directly at the final canonical name. The
+        canonical name does not need to be registered (yet).
+
+        Adding the same alias for the same canonical name twice is a no-op.
+
+        :raises ValueError:
+            If ``alias`` is already used as a canonical plugin name, if
+            adding the alias would create a cycle (the full cycle is
+            reported), or if ``alias`` already points to a different
+            canonical name.
+        """
+        if alias in self._name2plugin:
+            raise ValueError(
+                f"cannot use {alias!r} as an alias: "
+                "the name is already used as a canonical plugin name"
+            )
+        # Normalize the chain: follow existing aliases from ``canonical`` to
+        # the final canonical name, watching for a cycle back to ``alias``.
+        chain = [canonical]
+        target = canonical
+        seen = {alias, canonical}
+        while target in self._alias2canonical:
+            target = self._alias2canonical[target]
+            if target in seen:
+                raise ValueError(
+                    "alias cycle detected: " + " -> ".join([alias, *chain, target])
+                )
+            seen.add(target)
+            chain.append(target)
+        if target == alias:
+            raise ValueError(f"alias cycle detected: {alias} -> {alias}")
+        existing = self._alias2canonical.get(alias)
+        if existing is not None:
+            if existing != target:
+                raise ValueError(
+                    f"alias conflict: {alias!r} already points to "
+                    f"{existing!r}, cannot re-point it to {target!r}"
+                )
+            return  # already registered, nothing to do
+        self._alias2canonical[alias] = target
+        # Keep the table flat: re-normalize aliases which pointed at ``alias``.
+        for key in list(self._alias2canonical):
+            self._alias2canonical[key] = self.resolve_name(key)
+
+    def remove_alias(self, alias: str) -> bool:
+        """Remove an alias previously registered with :meth:`add_alias`.
+
+        Returns whether the alias existed.
+        """
+        if alias in self._alias2canonical:
+            del self._alias2canonical[alias]
+            return True
+        return False
+
+    def resolve_name(self, name: str) -> str:
+        """Return the canonical plugin name for ``name``.
+
+        If ``name`` is an alias registered with :meth:`add_alias`, the alias
+        chain is followed to the canonical name; otherwise ``name`` is
+        returned unchanged.
+        """
+        seen = set()
+        while name in self._alias2canonical:
+            # Defensive: add_alias keeps the table acyclic.
+            if name in seen:
+                raise ValueError(f"alias cycle detected at {name!r}")
+            seen.add(name)
+            name = self._alias2canonical[name]
+        return name
+
+    def list_aliases(self) -> list[tuple[str, str]]:
+        """Return a list of (alias, canonical name) pairs for all aliases
+        registered with :meth:`add_alias`."""
+        return list(self._alias2canonical.items())
+
     def set_blocked(self, name: str) -> None:
-        """Block registrations of the given name, unregister if already registered."""
+        """Block registrations of the given name, unregister if already registered.
+
+        The name may be an alias (see :meth:`add_alias`); the block always
+        applies to the canonical name the alias resolves to, and aliases are
+        kept so the block can be queried through them.
+        """
+        name = self.resolve_name(name)
+        # unregister() drops aliases pointing at the canonical name; snapshot
+        # and restore them so the block remains visible through the aliases.
+        aliases = list(self._alias2canonical.items())
         self.unregister(name=name)
+        self._alias2canonical.update(aliases)
         self._name2plugin[name] = None
 
     def is_blocked(self, name: str) -> bool:
-        """Return whether the given plugin name is blocked."""
+        """Return whether the given plugin name is blocked.
+
+        The name may be an alias (see :meth:`add_alias`); it resolves to the
+        canonical name, since blocking applies to the canonical identity.
+        """
+        name = self.resolve_name(name)
         return name in self._name2plugin and self._name2plugin[name] is None
 
     def unblock(self, name: str) -> bool:
         """Unblocks a name.
 
+        The name may be an alias (see :meth:`add_alias`); it resolves to the
+        canonical name.
+
         Returns whether the name was actually blocked.
         """
+        name = self.resolve_name(name)
         if self._name2plugin.get(name, -1) is None:
             del self._name2plugin[name]
             return True
@@ -386,11 +511,19 @@ class PluginManager:
         return name or str(id(plugin))
 
     def get_plugin(self, name: str) -> Any | None:
-        """Return the plugin registered under the given name, if any."""
-        return self._name2plugin.get(name)
+        """Return the plugin registered under the given name, if any.
+
+        The name may be an alias (see :meth:`add_alias`); it resolves to the
+        canonical name, so an alias and its canonical name return the same
+        plugin object.
+        """
+        return self._name2plugin.get(self.resolve_name(name))
 
     def has_plugin(self, name: str) -> bool:
-        """Return whether a plugin with the given name is registered."""
+        """Return whether a plugin with the given name is registered.
+
+        The name may be an alias (see :meth:`add_alias`).
+        """
         return self.get_plugin(name) is not None
 
     def get_name(self, plugin: _Plugin) -> str | None:

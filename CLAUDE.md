@@ -13,6 +13,7 @@ All commands use `uv run` for consistent environments.
 
 ### Testing
 - `uv run pytest` - Run all tests (prefer running all tests for quick feedback)
+- `uv run pytest testing/test_pluginmanager.py -k alias` - Run only the plugin alias tests
 - `uv run pytest testing/benchmark.py` - Run benchmark tests
 
 ### Code Quality

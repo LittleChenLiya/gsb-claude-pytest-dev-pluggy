@@ -751,6 +751,51 @@ You can block any plugin from being registered using
 *plugin* is blocked by name using :py:meth:`~pluggy.PluginManager.is_blocked()`.
 
 
+.. _aliases:
+
+Aliases
+-------
+A :py:class:`~pluggy.PluginManager` maintains an explicit alias table so
+that callers can refer to a plugin by alternate names, while the plugin's
+registered identity remains its single canonical name.
+
+Use :py:meth:`~pluggy.PluginManager.add_alias()` to map an alias to a
+canonical plugin name, :py:meth:`~pluggy.PluginManager.remove_alias()` to
+drop an alias, :py:meth:`~pluggy.PluginManager.resolve_name()` to resolve a
+name or alias to its canonical name, and
+:py:meth:`~pluggy.PluginManager.list_aliases()` to inspect the table.
+
+Alias chains are normalized when an alias is added, so every alias points
+directly at the final canonical name. Adding an alias is rejected with a
+:py:exc:`ValueError` if it would create a cycle (the full cycle is
+reported), if the alias already points to a different canonical name, or if
+the alias name is already used as a canonical plugin name.
+
+Aliases only affect name lookups:
+
+- :py:meth:`~pluggy.PluginManager.get_plugin()` and
+  :py:meth:`~pluggy.PluginManager.has_plugin()` return the same plugin
+  object for an alias and its canonical name.
+- :py:meth:`~pluggy.PluginManager.register()` registers the plugin under
+  the canonical name when given an alias, so an alias never creates a
+  second registration and historic hook calls are not replayed twice.
+- :py:meth:`~pluggy.PluginManager.unregister()` accepts any alias, removes
+  the same single registration, and drops the aliases which pointed at it.
+- :py:meth:`~pluggy.PluginManager.set_blocked()`,
+  :py:meth:`~pluggy.PluginManager.is_blocked()` and
+  :py:meth:`~pluggy.PluginManager.unblock()` apply to the canonical
+  identity, so blocking an alias blocks the canonical name (and vice
+  versa).
+
+.. code-block:: python
+
+    pm = pluggy.PluginManager("my_project_name")
+    pm.register(my_plugin, "new-name")
+    pm.add_alias("old-name", "new-name")
+    assert pm.get_plugin("old-name") is my_plugin
+    pm.set_blocked("old-name")  # blocks the canonical "new-name"
+
+
 Inspection
 ----------
 You can use a variety of methods to inspect both the registry

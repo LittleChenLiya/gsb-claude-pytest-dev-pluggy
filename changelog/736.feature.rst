@@ -1,0 +1,6 @@
+Add an explicit plugin alias table to ``PluginManager``: ``add_alias()``,
+``remove_alias()``, ``resolve_name()`` and ``list_aliases()``. Callers can
+query, register, unregister and block plugins through aliases, while the
+registered identity remains the single canonical name. Alias chains are
+normalized on insertion; cycles and conflicting aliases are rejected with a
+``ValueError``.
