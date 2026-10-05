@@ -1,0 +1,7 @@
+Add optional wrapper audit. Pass a ``wrapper_audit`` callback to
+:class:`~pluggy.PluginManager` to record how exceptions are retained,
+replaced or restored to results at each wrapper layer, in real execution
+order. The audit is purely observational: it never calls a wrapper, never
+compares exception strings, and never changes the hook result. A failing
+audit callback is reported independently through a warning and does not
+affect the hook result.

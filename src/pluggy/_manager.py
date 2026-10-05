@@ -14,6 +14,8 @@ from typing import TypeAlias
 import warnings
 
 from . import _tracing
+from ._audit import _current_audit
+from ._audit import WrapperAudit
 from ._callers import _multicall
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
@@ -26,6 +28,7 @@ from ._hooks import HookRelay
 from ._hooks import HookspecOpts
 from ._hooks import normalize_hookimpl_opts
 from ._result import Result
+from ._warnings import PluggyWrapperAuditWarning
 
 
 if TYPE_CHECKING:
@@ -156,7 +159,11 @@ class PluginManager:
         The short project name. Prefer snake case. Make sure it's unique!
     """
 
-    def __init__(self, project_name: str) -> None:
+    def __init__(
+        self,
+        project_name: str,
+        wrapper_audit: Callable[[WrapperAudit], None] | None = None,
+    ) -> None:
         #: The project name.
         self.project_name: Final = project_name
         self._name2plugin: Final[dict[str, _Plugin]] = {}
@@ -171,6 +178,10 @@ class PluginManager:
             "pluginmanage"
         )
         self._inner_hookexec = _multicall
+        #: Optional callback invoked with the :class:`~pluggy.WrapperAudit`
+        #: after each hook call.  When ``None`` (the default) wrapper
+        #: auditing is disabled and hook calls behave exactly as before.
+        self._wrapper_audit = wrapper_audit
 
     def _hookexec(
         self,
@@ -181,7 +192,37 @@ class PluginManager:
     ) -> object | list[object]:
         # called from all hookcaller instances.
         # enable_tracing will set its own wrapping function at self._inner_hookexec
-        return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+        #
+        # When wrapper auditing is enabled, a fresh audit collector is made
+        # available to the multicall loop through a context variable.  The
+        # hook call itself runs exactly as it would without auditing -- the
+        # audit is purely observational and never calls a wrapper.
+        audit = WrapperAudit(hook_name) if self._wrapper_audit is not None else None
+        token = _current_audit.set(audit)
+        try:
+            return self._inner_hookexec(hook_name, methods, kwargs, firstresult)
+        finally:
+            _current_audit.reset(token)
+            if audit is not None:
+                self._notify_wrapper_audit(audit)
+
+    def _notify_wrapper_audit(self, audit: WrapperAudit) -> None:
+        """Invoke the wrapper audit callback, reporting failures independently.
+
+        A failure in the audit callback (the "log callback") must never
+        change the result of the hook call that produced the audit.  Such a
+        failure is reported through a dedicated warning instead.
+        """
+        try:
+            self._wrapper_audit(audit)  # type: ignore[misc]
+        except BaseException as e:
+            warnings.warn(
+                PluggyWrapperAuditWarning(
+                    f"Wrapper audit callback failed for hook {audit.hook_name!r}: "
+                    f"{type(e).__name__}: {e}"
+                ),
+                stacklevel=4,
+            )
 
     def register(self, plugin: _Plugin, name: str | None = None) -> str | None:
         """Register a plugin and return its name.

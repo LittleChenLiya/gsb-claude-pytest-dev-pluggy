@@ -13,6 +13,14 @@ from typing import TYPE_CHECKING
 from typing import TypeAlias
 import warnings
 
+from ._audit import _current_audit
+from ._audit import BROKEN
+from ._audit import REPLACED
+from ._audit import RESTORED
+from ._audit import RETAINED
+from ._audit import RETURNED
+from ._audit import WrapperAudit
+from ._audit import WrapperAuditEntry
 from ._hooks import HookImpl
 from ._result import HookCallError
 from ._result import Result
@@ -79,6 +87,53 @@ def _warn_teardown_exception(
     warnings.warn(PluggyTeardownRaisedWarning(msg), stacklevel=6)
 
 
+def _audit_teardown(
+    audit: WrapperAudit | None,
+    hook_impl: HookImpl,
+    wrapper_kind: str,
+    before_exc: BaseException | None,
+    after_exc: BaseException | None,
+) -> None:
+    """Record how a single wrapper layer handled the outcome.
+
+    The audit is passive: it never calls the wrapper and never compares
+    exception strings.  It only observes the outcome *before* and *after*
+    the wrapper's post-yield block ran.  Exceptions are compared by identity
+    (``is``), so a retained exception is the very same object that was
+    passed in.  The report only retains the exception type and the layer
+    identity (``plugin_name``); result values are never recorded.
+    """
+    if audit is None:
+        return
+    if before_exc is not None:
+        if after_exc is not None:
+            # Same object passed through unchanged -> retained (保留);
+            # a different exception -> replaced (替换).
+            action = RETAINED if after_exc is before_exc else REPLACED
+        else:
+            # An exception was turned into a result -> restored (恢复),
+            # i.e. the wrapper "took over" (已接管).
+            action = RESTORED
+    else:
+        if after_exc is not None:
+            # A result was turned into an exception -> thrown (抛出).
+            action = BROKEN
+        else:
+            # A result was passed through -> returned (放行).
+            action = RETURNED
+    audit.record(
+        WrapperAuditEntry(
+            plugin_name=hook_impl.plugin_name,
+            wrapper=wrapper_kind,
+            action=action,
+            input_is_exception=before_exc is not None,
+            input_type=type(before_exc).__name__ if before_exc is not None else None,
+            output_is_exception=after_exc is not None,
+            output_type=type(after_exc).__name__ if after_exc is not None else None,
+        )
+    )
+
+
 def _multicall(
     hook_name: str,
     hook_impls: Sequence[HookImpl],
@@ -93,7 +148,11 @@ def _multicall(
     __tracebackhide__ = True
     results: list[object] = []
     exception = None
-    teardowns: list[Teardown] = []
+    # Each teardown is paired with the hook implementation that produced it
+    # and the wrapper protocol it uses, so the wrapper audit can attribute
+    # an outcome to the correct layer.
+    teardowns: list[tuple[Teardown, HookImpl, str]] = []
+    audit = _current_audit.get()
     try:  # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
@@ -107,7 +166,7 @@ def _multicall(
                 function_gen = run_old_style_hookwrapper(hook_impl, hook_name, args)
 
                 next(function_gen)  # first yield
-                teardowns.append(function_gen)
+                teardowns.append((function_gen, hook_impl, "hookwrapper"))
 
             elif hook_impl.wrapper:
                 res = hook_impl.function(*args)
@@ -121,7 +180,7 @@ def _multicall(
                     next(function_gen)  # first yield
                 except StopIteration:
                     _raise_wrapfail(function_gen, "did not yield")
-                teardowns.append(function_gen)
+                teardowns.append((function_gen, hook_impl, "wrapper"))
             else:
                 res = hook_impl.function(*args)
                 if res is not None:
@@ -137,7 +196,8 @@ def _multicall(
             result = results
 
         # run all wrapper post-yield blocks
-        for teardown in reversed(teardowns):
+        for teardown, hook_impl, wrapper_kind in reversed(teardowns):
+            before_exc = exception
             try:
                 if exception is not None:
                     try:
@@ -150,6 +210,13 @@ def _multicall(
                             and re.__cause__ is exception
                         ):
                             teardown.close()
+                            _audit_teardown(
+                                audit,
+                                hook_impl,
+                                wrapper_kind,
+                                before_exc,
+                                exception,
+                            )
                             continue
                         else:
                             raise
@@ -162,9 +229,11 @@ def _multicall(
             except StopIteration as si:
                 result = si.value
                 exception = None
+                _audit_teardown(audit, hook_impl, wrapper_kind, before_exc, None)
                 continue
             except BaseException as e:
                 exception = e
+                _audit_teardown(audit, hook_impl, wrapper_kind, before_exc, e)
                 continue
             _raise_wrapfail(teardown, "has second yield")
 

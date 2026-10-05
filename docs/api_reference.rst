@@ -49,6 +49,22 @@ API Reference
     :members:
 
 
+Wrapper audit
+-------------
+
+The optional wrapper audit records how exceptions are retained, replaced or
+restored to results at each wrapper layer, in real execution order.  It is
+purely observational: it never calls a wrapper, never compares exception
+strings, and never changes the hook result.  Enable it by passing a
+``wrapper_audit`` callback to :class:`~pluggy.PluginManager`.
+
+.. autoclass:: pluggy.WrapperAudit()
+    :members:
+
+.. autoclass:: pluggy.WrapperAuditEntry()
+    :members:
+
+
 Warnings
 --------
 
@@ -58,4 +74,7 @@ Custom warnings generated in some situations such as improper usage or deprecate
     :show-inheritance:
 
 .. autoclass:: pluggy.PluggyTeardownRaisedWarning()
+    :show-inheritance:
+
+.. autoclass:: pluggy.PluggyWrapperAuditWarning()
     :show-inheritance:

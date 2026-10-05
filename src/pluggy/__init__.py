@@ -9,11 +9,16 @@ __all__ = [
     "HookspecOpts",
     "PluggyTeardownRaisedWarning",
     "PluggyWarning",
+    "PluggyWrapperAuditWarning",
     "PluginManager",
     "PluginValidationError",
     "Result",
+    "WrapperAudit",
+    "WrapperAuditEntry",
     "__version__",
 ]
+from ._audit import WrapperAudit
+from ._audit import WrapperAuditEntry
 from ._hooks import HookCaller
 from ._hooks import HookImpl
 from ._hooks import HookimplMarker
@@ -27,6 +32,7 @@ from ._result import HookCallError
 from ._result import Result
 from ._warnings import PluggyTeardownRaisedWarning
 from ._warnings import PluggyWarning
+from ._warnings import PluggyWrapperAuditWarning
 
 
 def __getattr__(name: str) -> str:

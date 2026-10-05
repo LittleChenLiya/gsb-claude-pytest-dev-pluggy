@@ -25,3 +25,14 @@ class PluggyTeardownRaisedWarning(PluggyWarning):
     """
 
     __module__ = "pluggy"
+
+
+@final
+class PluggyWrapperAuditWarning(PluggyWarning):
+    """The optional wrapper audit callback raised an exception.
+
+    The hook call that produced the audit completed normally; only the
+    reporting of the audit failed.  The hook result is unaffected.
+    """
+
+    __module__ = "pluggy"
