@@ -1145,3 +1145,299 @@ def test_get_hookcallers_no_duplicates(pm: PluginManager) -> None:
     # Both hello impls are still wired up, and each caller works.
     assert pm.hook.hello(arg=1) == [101, 2]
     assert pm.hook.goodbye(arg=1) == [201]
+
+
+# ---------------------------------------------------------------------------
+# Plugin alias tests
+# ---------------------------------------------------------------------------
+
+
+def test_alias_basic(pm: PluginManager) -> None:
+    """An alias maps to the same plugin as the canonical name."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    assert pm.get_plugin("old_name") is plugin
+    assert pm.get_plugin("new_name") is plugin
+    assert pm.has_plugin("old_name")
+    assert pm.has_plugin("new_name")
+    assert pm.get_name(plugin) == "new_name"
+
+
+def test_alias_chain_normalized(pm: PluginManager) -> None:
+    """Alias chains are normalized to the final canonical name."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="canonical")
+    pm.add_alias("a", "canonical")
+    pm.add_alias("b", "a")
+    pm.add_alias("c", "b")
+
+    assert pm.get_plugin("a") is plugin
+    assert pm.get_plugin("b") is plugin
+    assert pm.get_plugin("c") is plugin
+    assert pm.get_plugin("canonical") is plugin
+
+
+def test_alias_cycle_rejected(pm: PluginManager) -> None:
+    """Adding an alias that would form a cycle raises ValueError."""
+    pm.add_alias("a", "b")
+    with pytest.raises(ValueError, match="Alias cycle detected"):
+        pm.add_alias("b", "a")
+
+
+def test_alias_cycle_three_nodes(pm: PluginManager) -> None:
+    """A longer cycle (a -> b -> c -> a) is also rejected."""
+    pm.add_alias("a", "b")
+    pm.add_alias("b", "c")
+    with pytest.raises(ValueError, match="Alias cycle detected"):
+        pm.add_alias("c", "a")
+
+
+def test_alias_conflict_rejected(pm: PluginManager) -> None:
+    """Re-registering an alias under a different canonical name raises."""
+
+    class A:
+        pass
+
+    pm.register(A(), name="one")
+    pm.register(A(), name="two")
+    pm.add_alias("alias", "one")
+    with pytest.raises(ValueError, match="Alias conflict"):
+        pm.add_alias("alias", "two")
+
+
+def test_alias_redefine_same_target(pm: PluginManager) -> None:
+    """Re-registering an alias to the same canonical name is a no-op."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="canonical")
+    pm.add_alias("alias", "canonical")
+    pm.add_alias("alias", "canonical")  # should not raise
+    assert pm.get_plugin("alias") is plugin
+
+
+def test_alias_blocking_by_canonical_identity(pm: PluginManager) -> None:
+    """Blocking via an alias blocks the canonical name too."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    pm.set_blocked("old_name")
+    assert pm.is_blocked("old_name")
+    assert pm.is_blocked("new_name")
+    assert pm.get_plugin("old_name") is None
+    assert pm.get_plugin("new_name") is None
+    assert not pm.is_registered(plugin)
+
+    # Registering under the canonical name is also blocked.
+    assert pm.register(A(), name="new_name") is None
+    # Registering under the alias is blocked as well.
+    assert pm.register(A(), name="old_name") is None
+
+
+def test_alias_unblock(pm: PluginManager) -> None:
+    """Unblocking via an alias unblocks the canonical name."""
+
+    class A:
+        pass
+
+    pm.set_blocked("new_name")
+    pm.add_alias("old_name", "new_name")
+    assert pm.is_blocked("old_name")
+    assert pm.unblock("old_name")
+    assert not pm.is_blocked("old_name")
+    assert not pm.is_blocked("new_name")
+    # The alias still resolves to the (now unblocked) canonical name.
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    assert pm.get_plugin("old_name") is plugin
+
+
+def test_alias_unregister_removes_plugin(pm: PluginManager) -> None:
+    """Unregistering via an alias removes the plugin and cleans up aliases."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+    pm.add_alias("other", "new_name")
+
+    assert pm.unregister(name="old_name") is plugin
+    assert pm.get_plugin("old_name") is None
+    assert pm.get_plugin("new_name") is None
+    assert pm.get_plugin("other") is None
+    assert not pm.is_registered(plugin)
+    # The alias mappings pointing to the removed canonical name are gone.
+    assert "old_name" not in pm._plugin_aliases
+    assert "other" not in pm._plugin_aliases
+
+
+def test_alias_unregister_by_plugin(pm: PluginManager) -> None:
+    """Unregistering by plugin object also cleans up alias mappings."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    assert pm.unregister(plugin) is plugin
+    assert pm.get_plugin("old_name") is None
+    assert pm.get_plugin("new_name") is None
+    assert "old_name" not in pm._plugin_aliases
+
+
+def test_alias_register_under_alias(pm: PluginManager) -> None:
+    """Registering under an alias registers under the canonical name."""
+
+    class A:
+        pass
+
+    pm.add_alias("old_name", "new_name")
+    plugin = A()
+    name = pm.register(plugin, name="old_name")
+    assert name == "new_name"
+    assert pm.get_plugin("old_name") is plugin
+    assert pm.get_plugin("new_name") is plugin
+    assert pm.get_name(plugin) == "new_name"
+
+
+def test_alias_register_under_alias_blocked(pm: PluginManager) -> None:
+    """Registering under an alias whose canonical name is blocked returns None."""
+
+    class A:
+        pass
+
+    pm.set_blocked("new_name")
+    pm.add_alias("old_name", "new_name")
+    assert pm.register(A(), name="old_name") is None
+
+
+def test_alias_no_historic_replay(pm: PluginManager) -> None:
+    """Adding an alias does not replay historic hook calls."""
+    out: list[object] = []
+
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: object) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: object) -> None:
+            out.append(arg)
+
+    plugin = Plugin()
+    pm.register(plugin, name="new_name")
+    pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+    assert out == [1]
+
+    # Adding an alias must not trigger a replay.
+    pm.add_alias("old_name", "new_name")
+    assert out == [1]
+
+    # Querying through the alias works.
+    assert pm.get_plugin("old_name") is plugin
+
+
+def test_alias_historic_replay_once_on_reregistration(
+    pm: PluginManager,
+) -> None:
+    """Re-registering after unregistering via an alias replays history once."""
+    out: list[object] = []
+
+    class Hooks:
+        @hookspec(historic=True)
+        def he_method1(self, arg: object) -> None: ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: object) -> None:
+            out.append(arg)
+
+    plugin = Plugin()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+    pm.hook.he_method1.call_historic(kwargs={"arg": 1})
+    assert out == [1]
+
+    # Unregister via the alias; the alias mappings are cleaned up.
+    pm.unregister(name="old_name")
+    assert out == [1]
+
+    # Re-registering replays the history exactly once.
+    pm.register(plugin, name="new_name")
+    assert out == [1, 1]
+
+
+def test_alias_with_hook_calls(pm: PluginManager) -> None:
+    """Aliases work with hook calls through the hook relay."""
+
+    class Hooks:
+        @hookspec
+        def he_method1(self, arg: object) -> object: ...
+
+    pm.add_hookspecs(Hooks)
+
+    class Plugin:
+        @hookimpl
+        def he_method1(self, arg: object) -> object:
+            return arg + 1
+
+    plugin = Plugin()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    assert pm.hook.he_method1(arg=1) == [2]
+
+    # Unregistering via the alias removes the hook implementation.
+    pm.unregister(name="old_name")
+    assert pm.hook.he_method1(arg=1) == []
+
+
+def test_alias_list_name_plugin(pm: PluginManager) -> None:
+    """list_name_plugin returns canonical names only, not aliases."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    assert pm.list_name_plugin() == [("new_name", plugin)]
+
+
+def test_alias_get_plugins(pm: PluginManager) -> None:
+    """get_plugins returns each registered plugin exactly once."""
+
+    class A:
+        pass
+
+    plugin = A()
+    pm.register(plugin, name="new_name")
+    pm.add_alias("old_name", "new_name")
+
+    assert pm.get_plugins() == {plugin}

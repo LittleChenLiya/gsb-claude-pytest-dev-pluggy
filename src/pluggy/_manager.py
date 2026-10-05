@@ -160,6 +160,11 @@ class PluginManager:
         #: The project name.
         self.project_name: Final = project_name
         self._name2plugin: Final[dict[str, _Plugin]] = {}
+        #: Explicit alias table mapping alias names to canonical plugin names.
+        #: The true registration identity of every plugin is its canonical name
+        #: in :attr:`_name2plugin`; aliases are only alternate handles used to
+        #: query or block the same registered plugin.
+        self._plugin_aliases: Final[dict[str, str]] = {}
         self._plugin_distinfo: Final[
             list[tuple[_Plugin, importlib.metadata.Distribution]]
         ] = []
@@ -197,6 +202,10 @@ class PluginManager:
         If the plugin is already registered, raises a :exc:`ValueError`.
         """
         plugin_name = name or self.get_canonical_name(plugin)
+        # The canonical name is the only true registration identity. If the
+        # given name is an alias, resolve it to its canonical name so the
+        # plugin is registered under the canonical name rather than the alias.
+        plugin_name = self._resolve_alias(plugin_name)
 
         if plugin_name in self._name2plugin:
             if self._name2plugin.get(plugin_name, -1) is None:
@@ -240,6 +249,73 @@ class PluginManager:
                 hook._add_hookimpl(hookimpl)
         return plugin_name
 
+    def add_alias(self, alias: str, canonical_name: str) -> None:
+        """Register an explicit alias for a plugin's canonical name.
+
+        After registering an alias, callers can use the alias (or any other
+        alias) to query or block the same plugin registered under its canonical
+        name. The canonical name is the only true registration identity; the
+        alias table merely maps alternate handles to it.
+
+        Alias chains are normalized before being stored: the target is
+        resolved through any existing aliases to its final canonical name.
+        Cycles (e.g. ``a -> b -> a``) and conflicts (the alias already points
+        to a different canonical name) are rejected before any state is
+        changed.
+
+        :param alias:
+            The alternate name to register.
+        :param canonical_name:
+            The canonical plugin name (or an existing alias) that ``alias``
+            should resolve to.
+
+        :raises ValueError:
+            If adding the alias would create a cycle or conflict.
+        """
+        target = self._resolve_alias(canonical_name)
+
+        # A cycle is formed when the resolved target leads back to the alias
+        # itself (e.g. a -> b, b -> a).
+        if target == alias:
+            raise ValueError(
+                f"Alias cycle detected: {alias!r} -> {canonical_name!r} "
+                f"-> ... -> {alias!r}"
+            )
+
+        existing = self._plugin_aliases.get(alias)
+        if existing is not None and existing != target:
+            raise ValueError(
+                f"Alias conflict: {alias!r} already points to {existing!r}, "
+                f"cannot point to {target!r}"
+            )
+
+        self._plugin_aliases[alias] = target
+
+    def _resolve_alias(self, name: str) -> str:
+        """Resolve ``name`` to its canonical plugin name.
+
+        Follows alias chains until a name that is not itself an alias is
+        reached. Raises :class:`ValueError` if a cycle is encountered while
+        resolving (defensive; cycles are normally rejected by
+        :meth:`add_alias`).
+        """
+        seen: set[str] = set()
+        current = name
+        while current in self._plugin_aliases:
+            if current in seen:
+                raise ValueError(f"Alias cycle detected while resolving {name!r}")
+            seen.add(current)
+            current = self._plugin_aliases[current]
+        return current
+
+    def _aliases_for(self, canonical_name: str) -> list[str]:
+        """Return all aliases that resolve to ``canonical_name``."""
+        return [
+            alias
+            for alias, target in self._plugin_aliases.items()
+            if target == canonical_name
+        ]
+
     def parse_hookimpl_opts(self, plugin: _Plugin, name: str) -> HookimplOpts | None:
         """Try to obtain a hook implementation from an item with the given name
         in the given plugin which is being searched for hook impls.
@@ -264,12 +340,21 @@ class PluginManager:
         )
 
     def unregister(
-        self, plugin: _Plugin | None = None, name: str | None = None
+        self,
+        plugin: _Plugin | None = None,
+        name: str | None = None,
+        *,
+        _cleanup_aliases: bool = True,
     ) -> Any | None:
         """Unregister a plugin and all of its hook implementations.
 
         The plugin can be specified either by the plugin object or the plugin
         name. If both are specified, they must agree.
+
+        When ``name`` is an alias, it is resolved to its canonical name first;
+        unregistering through any alias removes the same plugin and cleans up
+        all alias mappings pointing to that canonical name. Historic hook
+        playback is not replayed by this operation.
 
         Returns the unregistered plugin, or ``None`` if not found.
         """
@@ -278,9 +363,15 @@ class PluginManager:
             name = self.get_name(plugin)
             assert name is not None, "plugin is not registered"
 
+        canonical_name = self._resolve_alias(name)
+
         if plugin is None:
-            plugin = self.get_plugin(name)
+            plugin = self.get_plugin(canonical_name)
             if plugin is None:
+                return None
+        else:
+            registered = self.get_plugin(canonical_name)
+            if registered is not None and registered != plugin:
                 return None
 
         hookcallers = self.get_hookcallers(plugin)
@@ -288,29 +379,52 @@ class PluginManager:
             for hookcaller in hookcallers:
                 hookcaller._remove_plugin(plugin)
 
-        # if self._name2plugin[name] == None registration was blocked: ignore
-        if self._name2plugin.get(name):
-            assert name is not None
-            del self._name2plugin[name]
+        # if self._name2plugin[canonical_name] == None registration was
+        # blocked: ignore
+        if self._name2plugin.get(canonical_name):
+            assert canonical_name is not None
+            del self._name2plugin[canonical_name]
+
+        # Clean up all aliases pointing to the removed canonical name.
+        if _cleanup_aliases:
+            for alias in self._aliases_for(canonical_name):
+                del self._plugin_aliases[alias]
 
         return plugin
 
     def set_blocked(self, name: str) -> None:
-        """Block registrations of the given name, unregister if already registered."""
-        self.unregister(name=name)
-        self._name2plugin[name] = None
+        """Block registrations of the given name, unregister if already registered.
+
+        When ``name`` is an alias, it is resolved to its canonical name first,
+        so blocking takes effect by canonical identity. Alias mappings are
+        preserved so that querying or blocking through an alias continues to
+        resolve to the blocked canonical name.
+        """
+        canonical_name = self._resolve_alias(name)
+        self.unregister(name=canonical_name, _cleanup_aliases=False)
+        self._name2plugin[canonical_name] = None
 
     def is_blocked(self, name: str) -> bool:
-        """Return whether the given plugin name is blocked."""
-        return name in self._name2plugin and self._name2plugin[name] is None
+        """Return whether the given plugin name is blocked.
+
+        When ``name`` is an alias, it is resolved to its canonical name first.
+        """
+        canonical_name = self._resolve_alias(name)
+        return (
+            canonical_name in self._name2plugin
+            and self._name2plugin[canonical_name] is None
+        )
 
     def unblock(self, name: str) -> bool:
         """Unblocks a name.
 
+        When ``name`` is an alias, it is resolved to its canonical name first.
+
         Returns whether the name was actually blocked.
         """
-        if self._name2plugin.get(name, -1) is None:
-            del self._name2plugin[name]
+        canonical_name = self._resolve_alias(name)
+        if self._name2plugin.get(canonical_name, -1) is None:
+            del self._name2plugin[canonical_name]
             return True
         return False
 
@@ -386,11 +500,20 @@ class PluginManager:
         return name or str(id(plugin))
 
     def get_plugin(self, name: str) -> Any | None:
-        """Return the plugin registered under the given name, if any."""
-        return self._name2plugin.get(name)
+        """Return the plugin registered under the given name, if any.
+
+        When ``name`` is an alias, it is resolved to its canonical name first,
+        so querying through an alias returns the same plugin as querying
+        through the canonical name.
+        """
+        canonical_name = self._resolve_alias(name)
+        return self._name2plugin.get(canonical_name)
 
     def has_plugin(self, name: str) -> bool:
-        """Return whether a plugin with the given name is registered."""
+        """Return whether a plugin with the given name is registered.
+
+        When ``name`` is an alias, it is resolved to its canonical name first.
+        """
         return self.get_plugin(name) is not None
 
     def get_name(self, plugin: _Plugin) -> str | None:
