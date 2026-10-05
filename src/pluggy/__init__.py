@@ -12,8 +12,14 @@ __all__ = [
     "PluginManager",
     "PluginValidationError",
     "Result",
+    "WrapperAuditFailure",
+    "WrapperAuditReport",
+    "WrapperAuditStage",
     "__version__",
 ]
+from ._audit import WrapperAuditFailure
+from ._audit import WrapperAuditReport
+from ._audit import WrapperAuditStage
 from ._hooks import HookCaller
 from ._hooks import HookImpl
 from ._hooks import HookimplMarker

@@ -14,7 +14,10 @@ from typing import TypeAlias
 import warnings
 
 from . import _tracing
+from ._audit import WrapperAuditFailure
+from ._audit import WrapperAuditReport
 from ._callers import _multicall
+from ._hooks import _HookExec
 from ._hooks import _HookImplFunction
 from ._hooks import _Namespace
 from ._hooks import _Plugin
@@ -170,7 +173,8 @@ class PluginManager:
         self.trace: Final[_tracing.TagTracerSub] = _tracing.TagTracer().get(
             "pluginmanage"
         )
-        self._inner_hookexec = _multicall
+        self._inner_hookexec: _HookExec = _multicall
+        self._wrapper_audit_failures: Final[list[WrapperAuditFailure]] = []
 
     def _hookexec(
         self,
@@ -599,6 +603,82 @@ class PluginManager:
             hooktrace.root.indent -= 1
 
         return self.add_hookcall_monitoring(before, after)
+
+    def enable_wrapper_audit(
+        self, auditor: Callable[[WrapperAuditReport], object]
+    ) -> Callable[[], None]:
+        """Enable optional auditing of hook wrapper exception handling.
+
+        ``auditor`` is a callback invoked once per hook call with a
+        :class:`~pluggy.WrapperAuditReport`. The report contains one
+        :class:`~pluggy.WrapperAuditStage` per wrapper layer, collected in
+        real execution order, recording how an exception was preserved,
+        replaced or recovered into a result at that layer. Old-style
+        hookwrappers and new-style wrappers are each observed according to
+        their original protocol.
+
+        The audit is observational only: it never calls wrapper functions
+        itself and never compares exception messages; stages keep only
+        exception *types* and layer identities. The final result or exception
+        of a hook call is identical to a call without auditing, and hook
+        implementations/wrappers are not called any more often than usual.
+
+        A failure of the ``auditor`` callback itself never changes the hook
+        result; it is reported independently through
+        :attr:`wrapper_audit_failures`.
+
+        Returns an undo function which, when called, disables the auditing.
+
+        .. note::
+            To combine the audit with :meth:`enable_tracing` or
+            :meth:`add_hookcall_monitoring`, enable the audit *first*.
+        """
+        oldcall = self._inner_hookexec
+
+        def audited_hookexec(
+            hook_name: str,
+            hook_impls: Sequence[HookImpl],
+            caller_kwargs: Mapping[str, object],
+            firstresult: bool,
+        ) -> object | list[object]:
+            report = WrapperAuditReport(hook_name)
+            try:
+                if oldcall is _multicall:
+                    result = _multicall(
+                        hook_name, hook_impls, caller_kwargs, firstresult, audit=report
+                    )
+                else:
+                    result = oldcall(hook_name, hook_impls, caller_kwargs, firstresult)
+            except BaseException as exc:
+                report._set_outcome(exc)
+                raise
+            else:
+                report._set_outcome(None)
+                return result
+            finally:
+                try:
+                    auditor(report)
+                except Exception as e:
+                    # A failing log callback must not change the hook result;
+                    # report the failure independently instead.
+                    self._wrapper_audit_failures.append(
+                        WrapperAuditFailure(hook_name, e)
+                    )
+
+        self._inner_hookexec = audited_hookexec
+
+        def undo() -> None:
+            self._inner_hookexec = oldcall
+
+        return undo
+
+    @property
+    def wrapper_audit_failures(self) -> list[WrapperAuditFailure]:
+        """Independent reports of wrapper-audit callback failures.
+
+        See :meth:`enable_wrapper_audit`.
+        """
+        return self._wrapper_audit_failures.copy()
 
     def subset_hook_caller(
         self, name: str, remove_plugins: Iterable[_Plugin]

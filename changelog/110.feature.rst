@@ -1,0 +1,8 @@
+Add an optional wrapper audit via :meth:`pluggy.PluginManager.enable_wrapper_audit`.
+The audit records, in real execution order, how an exception is preserved, replaced
+or recovered into a result at each wrapper layer (old-style hookwrappers and
+new-style wrappers alike). The report keeps only exception types and layer
+identities, never calls wrapper functions itself, and never changes the final
+result or exception of a hook call. Failures of the audit callback are reported
+independently through :attr:`pluggy.PluginManager.wrapper_audit_failures`.
+Run the dedicated tests with ``pytest testing/test_wrapper_audit.py -v``.

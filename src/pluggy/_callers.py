@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 from typing import TypeAlias
 import warnings
 
+from ._audit import WrapperAuditReport
 from ._hooks import HookImpl
 from ._result import HookCallError
 from ._result import Result
@@ -84,16 +85,21 @@ def _multicall(
     hook_impls: Sequence[HookImpl],
     caller_kwargs: Mapping[str, object],
     firstresult: bool,
+    audit: WrapperAuditReport | None = None,
 ) -> object | list[object]:
     """Execute a call into multiple python functions/methods and return the
     result(s).
 
     ``caller_kwargs`` comes from HookCaller.__call__().
+
+    If ``audit`` is given, exception/result transitions at each wrapper layer
+    are recorded into it (observational only - wrappers are never called by
+    the audit itself, and the final result or exception is unaffected).
     """
     __tracebackhide__ = True
     results: list[object] = []
     exception = None
-    teardowns: list[Teardown] = []
+    teardowns: list[tuple[HookImpl, Teardown]] = []
     try:  # run impl and wrapper setup functions in a loop
         for hook_impl in reversed(hook_impls):
             try:
@@ -107,7 +113,7 @@ def _multicall(
                 function_gen = run_old_style_hookwrapper(hook_impl, hook_name, args)
 
                 next(function_gen)  # first yield
-                teardowns.append(function_gen)
+                teardowns.append((hook_impl, function_gen))
 
             elif hook_impl.wrapper:
                 res = hook_impl.function(*args)
@@ -121,7 +127,7 @@ def _multicall(
                     next(function_gen)  # first yield
                 except StopIteration:
                     _raise_wrapfail(function_gen, "did not yield")
-                teardowns.append(function_gen)
+                teardowns.append((hook_impl, function_gen))
             else:
                 res = hook_impl.function(*args)
                 if res is not None:
@@ -130,6 +136,10 @@ def _multicall(
                         break
     except BaseException as exc:
         exception = exc
+        if audit is not None:
+            # The impl/setup phase failed at hook_impl (loop variable is still
+            # bound to it): record the layer which originated the exception.
+            audit._record_stage(hook_impl, None, exc)
     finally:
         if firstresult:  # first result hooks return a single value
             result = results[0] if results else None
@@ -137,7 +147,9 @@ def _multicall(
             result = results
 
         # run all wrapper post-yield blocks
-        for teardown in reversed(teardowns):
+        for hook_impl, teardown in reversed(teardowns):
+            if audit is not None:
+                incoming = exception
             try:
                 if exception is not None:
                     try:
@@ -162,9 +174,13 @@ def _multicall(
             except StopIteration as si:
                 result = si.value
                 exception = None
+                if audit is not None:
+                    audit._record_stage(hook_impl, incoming, None)
                 continue
             except BaseException as e:
                 exception = e
+                if audit is not None:
+                    audit._record_stage(hook_impl, incoming, e)
                 continue
             _raise_wrapfail(teardown, "has second yield")
 
